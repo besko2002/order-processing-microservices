@@ -1,0 +1,59 @@
+# Runtime memory preservation — pins the CURRENT running tuning (verified 2026-11-13) so it is
+# reproducible from configuration. Values were read from the running containers via printenv and
+# are nonsecret (JVM flags only). Secrets stay in the git-ignored .env; they never belong here.
+#
+# Purpose: reproducibility of today's settings — NOT newly proven memory savings. Applying it
+# recreates containers (a runtime change) and is a separately USER-approved step; creating or
+# editing this file performs no runtime action.
+#
+# Why an overlay: the base compose deliberately carries different desired tuning
+# (JAVA_TOOL_OPTIONS "-XX:MaxRAMPercentage=65", Kafka Xms 128m). A plain base-compose up would
+# therefore DROP the current tuning. This overlay reproduces it; per-service values were verified
+# individually (not assumed) and the auth block matches infra/compose/auth-jwt-preserve-memory.yml
+# exactly, so the two overlays can be used together or separately without conflict.
+#
+# An optional Kafka Xms 128m change stays a SEPARATELY approved decision and is NOT part of this
+# overlay: applying it must not silently change Kafka's heap either way.
+
+services:
+  auth-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  inventory-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  order-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  payment-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  notification-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  api-gateway:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  kafka:
+    # Pin the current heap so applying this overlay does not silently change the broker
+    # (base compose carries the not-yet-approved Xms 128m).
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"

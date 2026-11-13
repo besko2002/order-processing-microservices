@@ -6,6 +6,7 @@ import com.example.orders.order.service.OrderService;
 import com.example.orders.support.security.CurrentUser;
 import jakarta.validation.Valid;
 import java.net.URI;
+import java.util.List;
 import java.util.UUID;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -96,6 +97,19 @@ class OrderController {
     @GetMapping("/{id}")
     OrderResponse one(@PathVariable UUID id) {
         return orders.get(id, CurrentUser.requireId(), CurrentUser.hasRole(ADMIN));
+    }
+
+    /**
+     * The events and commands order-service emitted for an order, oldest first, with the Kafka
+     * topic and the relay timing of each. Payloads are not returned. Same access rule as
+     * {@link #one(UUID)}.
+     *
+     * @param id order id
+     * @return the outbox rows written for the order
+     */
+    @GetMapping("/{id}/events")
+    List<OrderEventResponse> events(@PathVariable UUID id) {
+        return orders.events(id, CurrentUser.requireId(), CurrentUser.hasRole(ADMIN));
     }
 
     /**

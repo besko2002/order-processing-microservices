@@ -53,6 +53,7 @@ public class AuthJwtKeys {
         if (hasPrivate) {
             privateKey = PemKeys.readPrivateKey(jwt.privateKey());
             publicKey = PemKeys.readPublicKey(jwt.publicKey());
+            validateKeyPair(privateKey, publicKey);
             this.ephemeral = false;
         } else {
             KeyPair generated = generateRsaKeyPair();
@@ -117,6 +118,36 @@ public class AuthJwtKeys {
             return generator.generateKeyPair();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("RSA key pair generation unavailable on this JVM", e);
+        }
+    }
+
+    private static void validateKeyPair(RSAPrivateKey privateKey, RSAPublicKey publicKey) {
+        if (!privateKey.getModulus().equals(publicKey.getModulus())) {
+            throw new IllegalStateException(
+                    "auth.jwt.private-key and auth.jwt.public-key do not form a matching RSA key pair "
+                            + "(AUTH_JWT_PRIVATE_KEY / AUTH_JWT_PUBLIC_KEY)");
+        }
+        try {
+            java.security.Signature signer = java.security.Signature.getInstance("SHA256withRSA");
+            signer.initSign(privateKey);
+            byte[] probe = new byte[] {0x41, 0x55, 0x54, 0x48}; // fixed nonsecret probe "AUTH"
+            signer.update(probe);
+            byte[] signature = signer.sign();
+
+            java.security.Signature verifier = java.security.Signature.getInstance("SHA256withRSA");
+            verifier.initVerify(publicKey);
+            verifier.update(probe);
+            if (!verifier.verify(signature)) {
+                throw new IllegalStateException(
+                        "auth.jwt.private-key and auth.jwt.public-key do not form a matching RSA key pair "
+                                + "(AUTH_JWT_PRIVATE_KEY / AUTH_JWT_PUBLIC_KEY)");
+            }
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "auth.jwt.private-key and auth.jwt.public-key do not form a matching RSA key pair "
+                            + "(AUTH_JWT_PRIVATE_KEY / AUTH_JWT_PUBLIC_KEY)", e);
         }
     }
 }

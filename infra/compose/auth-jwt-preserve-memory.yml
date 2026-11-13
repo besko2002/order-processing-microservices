@@ -1,0 +1,5 @@
+services:
+  auth-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"

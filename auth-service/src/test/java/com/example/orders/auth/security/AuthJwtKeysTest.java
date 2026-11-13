@@ -12,6 +12,7 @@ import com.nimbusds.jose.jwk.RSAKey;
 import com.nimbusds.jwt.SignedJWT;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
 import java.time.Instant;
@@ -80,6 +81,50 @@ class AuthJwtKeysTest {
     }
 
     @Test
+    void maintainsStableKeyIdAndKeyPairAcrossIndependentInstances() throws Exception {
+        String privatePem = pem("PRIVATE KEY", keyPair.getPrivate().getEncoded());
+        String publicPem = pem("PUBLIC KEY", keyPair.getPublic().getEncoded());
+        String stableKid = "auth-stable-kid-2026";
+        AuthProperties props = propertiesWith(privatePem, publicPem, stableKid);
+
+        AuthJwtKeys firstInstance = new AuthJwtKeys(props);
+        AuthJwtKeys secondInstance = new AuthJwtKeys(props);
+
+        assertThat(firstInstance.keyId()).isEqualTo(stableKid);
+        assertThat(secondInstance.keyId()).isEqualTo(stableKid);
+        assertThat(firstInstance.keyId()).isEqualTo(secondInstance.keyId());
+
+        assertThat(firstInstance.ephemeral()).isFalse();
+        assertThat(secondInstance.ephemeral()).isFalse();
+        assertThat(firstInstance.publicKey().getModulus())
+                .isEqualTo(secondInstance.publicKey().getModulus());
+        assertThat(firstInstance.publicKey().getPublicExponent())
+                .isEqualTo(secondInstance.publicKey().getPublicExponent());
+
+        String token = new NimbusJwtEncoder(firstInstance.jwkSource())
+                .encode(JwtEncoderParameters.from(
+                        JwsHeader.with(SignatureAlgorithm.RS256).keyId(firstInstance.keyId()).build(),
+                        JwtClaimsSet.builder()
+                                .issuer("order-processing-auth")
+                                .subject("00000000-0000-0000-0000-000000000002")
+                                .issuedAt(Instant.now())
+                                .expiresAt(Instant.now().plusSeconds(60))
+                                .build()))
+                .getTokenValue();
+
+        SignedJWT parsedToken = SignedJWT.parse(token);
+        assertThat(parsedToken.getHeader().getKeyID()).isEqualTo(stableKid);
+        JWSVerifier verifier = new RSASSAVerifier(secondInstance.publicKey());
+        assertThat(parsedToken.verify(verifier)).isTrue();
+
+        AuthJwtKeys ephemeral1 = new AuthJwtKeys(propertiesWith("", "", ""));
+        AuthJwtKeys ephemeral2 = new AuthJwtKeys(propertiesWith("", "", ""));
+        assertThat(ephemeral1.keyId()).isNotEqualTo(ephemeral2.keyId());
+        assertThat(ephemeral1.publicKey().getModulus())
+                .isNotEqualTo(ephemeral2.publicKey().getModulus());
+    }
+
+    @Test
     void acceptsSingleLinePemWithEscapedNewlines() {
         String privatePem = pem("PRIVATE KEY", keyPair.getPrivate().getEncoded()).replace("\n", "\\n");
         String publicPem = pem("PUBLIC KEY", keyPair.getPublic().getEncoded()).replace("\n", "\\n");
@@ -87,6 +132,21 @@ class AuthJwtKeysTest {
         AuthJwtKeys keys = new AuthJwtKeys(propertiesWith(privatePem, publicPem, "escaped-kid"));
 
         assertThat(keys.ephemeral()).isFalse();
+        assertThat(keys.publicKey().getModulus())
+                .isEqualTo(((RSAPublicKey) keyPair.getPublic()).getModulus());
+    }
+
+    @Test
+    void acceptsKeyPathsFromFileSystem(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path privFile = tempDir.resolve("jwt-priv.pem");
+        java.nio.file.Path pubFile = tempDir.resolve("jwt-pub.pem");
+        java.nio.file.Files.writeString(privFile, pem("PRIVATE KEY", keyPair.getPrivate().getEncoded()));
+        java.nio.file.Files.writeString(pubFile, pem("PUBLIC KEY", keyPair.getPublic().getEncoded()));
+
+        AuthJwtKeys keys = new AuthJwtKeys(propertiesWith(privFile.toString(), pubFile.toString(), "file-kid"));
+
+        assertThat(keys.ephemeral()).isFalse();
+        assertThat(keys.keyId()).isEqualTo("file-kid");
         assertThat(keys.publicKey().getModulus())
                 .isEqualTo(((RSAPublicKey) keyPair.getPublic()).getModulus());
     }
@@ -131,6 +191,121 @@ class AuthJwtKeysTest {
 
         assertThatThrownBy(() -> new AuthJwtKeys(garbage))
                 .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void rejectsOnlyPublicWithoutPrivate() {
+        AuthProperties onlyPublic =
+                propertiesWith("", pem("PUBLIC KEY", keyPair.getPublic().getEncoded()), "kid");
+
+        assertThatThrownBy(() -> new AuthJwtKeys(onlyPublic))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be configured together");
+    }
+
+    @Test
+    void rejectsMismatchedRsaKeyPair() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        KeyPair secondPair = generator.generateKeyPair();
+
+        AuthProperties mismatched = propertiesWith(
+                pem("PRIVATE KEY", keyPair.getPrivate().getEncoded()),
+                pem("PUBLIC KEY", secondPair.getPublic().getEncoded()),
+                "mismatched-kid");
+
+        assertThatThrownBy(() -> new AuthJwtKeys(mismatched))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("matching RSA key pair");
+    }
+
+    @Test
+    void rejectsKeyPairWithSameModulusButDifferentPublicExponent() throws Exception {
+        RSAPrivateKey priv = (RSAPrivateKey) keyPair.getPrivate();
+        RSAPublicKey pub = (RSAPublicKey) keyPair.getPublic();
+        java.math.BigInteger alternateExponent = pub.getPublicExponent().equals(java.math.BigInteger.valueOf(65537))
+                ? java.math.BigInteger.valueOf(3)
+                : java.math.BigInteger.valueOf(65537);
+
+        java.security.spec.RSAPublicKeySpec spec =
+                new java.security.spec.RSAPublicKeySpec(priv.getModulus(), alternateExponent);
+        RSAPublicKey mismatchedPub =
+                (RSAPublicKey) java.security.KeyFactory.getInstance("RSA").generatePublic(spec);
+
+        AuthProperties mismatchedExponent = propertiesWith(
+                pem("PRIVATE KEY", priv.getEncoded()),
+                pem("PUBLIC KEY", mismatchedPub.getEncoded()),
+                "mismatched-exp-kid");
+
+        assertThatThrownBy(() -> new AuthJwtKeys(mismatchedExponent))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("matching RSA key pair");
+    }
+
+    @Test
+    void rejectsNonexistentKeyPath() {
+        AuthProperties nonexistent =
+                propertiesWith("/nonexistent/file/jwt-private.pem", "/nonexistent/file/jwt-public.pem", "kid");
+
+        assertThatThrownBy(() -> new AuthJwtKeys(nonexistent))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining("nonexistent")
+                .hasMessageContaining("AUTH_JWT_PRIVATE_KEY");
+    }
+
+    @Test
+    void rejectsDirectoryKeyPath(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path dirPath = tempDir.resolve("dir-as-key");
+        java.nio.file.Files.createDirectory(dirPath);
+
+        AuthProperties dirKey = propertiesWith(dirPath.toString(), dirPath.toString(), "kid");
+
+        assertThatThrownBy(() -> new AuthJwtKeys(dirKey))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining(dirPath.toString());
+    }
+
+    @Test
+    void rejectsUnreadableKeyPathWhenEnforced(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path unreadableFile = tempDir.resolve("unreadable-priv.pem");
+        java.nio.file.Files.writeString(unreadableFile, pem("PRIVATE KEY", keyPair.getPrivate().getEncoded()));
+        unreadableFile.toFile().setReadable(false, false);
+
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                !java.nio.file.Files.isReadable(unreadableFile),
+                "Test runner runs with elevated permissions (e.g. root) bypassing POSIX read denials; skipping");
+
+        AuthProperties props = propertiesWith(unreadableFile.toString(), pem("PUBLIC KEY", keyPair.getPublic().getEncoded()), "kid");
+        assertThatThrownBy(() -> new AuthJwtKeys(props))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining(unreadableFile.toString());
+    }
+
+    @Test
+    void rejectsMalformedPemInFileWithoutLeakingContents(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path privFile = tempDir.resolve("malformed-priv.pem");
+        java.nio.file.Path pubFile = tempDir.resolve("malformed-pub.pem");
+        String secretBadContent = "SECRET_MALFORMED_HEADER_DATA_12345";
+        java.nio.file.Files.writeString(privFile, "-----BEGIN PRIVATE KEY-----\n" + secretBadContent + "\n-----END PRIVATE KEY-----");
+        java.nio.file.Files.writeString(pubFile, "-----BEGIN PUBLIC KEY-----\n" + secretBadContent + "\n-----END PUBLIC KEY-----");
+
+        AuthProperties props = propertiesWith(privFile.toString(), pubFile.toString(), "kid");
+
+        try {
+            new AuthJwtKeys(props);
+            org.junit.jupiter.api.Assertions.fail("Expected IllegalStateException");
+        } catch (IllegalStateException ex) {
+            java.io.StringWriter sw = new java.io.StringWriter();
+            ex.printStackTrace(new java.io.PrintWriter(sw));
+            String fullTrace = sw.toString();
+            assertThat(fullTrace).doesNotContain(secretBadContent);
+
+            Throwable current = ex;
+            while (current != null) {
+                assertThat(current.getMessage()).doesNotContain(secretBadContent);
+                current = current.getCause();
+            }
+        }
     }
 
     private static AuthProperties propertiesWith(String privateKey, String publicKey, String keyId) {

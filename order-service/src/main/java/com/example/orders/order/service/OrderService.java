@@ -1,6 +1,7 @@
 package com.example.orders.order.service;
 
 import com.example.orders.order.api.CreateOrderRequest;
+import com.example.orders.order.api.OrderEventResponse;
 import com.example.orders.order.api.OrderItemRequest;
 import com.example.orders.order.api.OrderResponse;
 import com.example.orders.order.client.CatalogProduct;
@@ -13,6 +14,7 @@ import com.example.orders.order.saga.OrderSaga;
 import com.example.orders.support.error.BadRequestException;
 import com.example.orders.support.error.ConflictException;
 import com.example.orders.support.error.NotFoundException;
+import com.example.orders.support.outbox.OutboxRepository;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -57,16 +59,19 @@ public class OrderService {
     private final ProductCatalogClient catalog;
     private final OrderTransactions transactions;
     private final OrderSaga saga;
+    private final OutboxRepository outbox;
 
     OrderService(
             OrderRepository orders,
             ProductCatalogClient catalog,
             OrderTransactions transactions,
-            OrderSaga saga) {
+            OrderSaga saga,
+            OutboxRepository outbox) {
         this.orders = orders;
         this.catalog = catalog;
         this.transactions = transactions;
         this.saga = saga;
+        this.outbox = outbox;
     }
 
     // ------------------------------------------------------------------ commands
@@ -146,6 +151,24 @@ public class OrderService {
                 .filter(order -> admin || order.getUserId().equals(callerId))
                 .map(OrderResponse::of)
                 .orElseThrow(() -> NotFoundException.of("Order", orderId));
+    }
+
+    /**
+     * The events and commands order-service emitted for one order, oldest first. Same access rule
+     * as {@link #get(UUID, UUID, boolean)}: owner or administrator, otherwise {@code 404}.
+     *
+     * @param orderId  order whose events to read
+     * @param callerId the authenticated caller
+     * @param admin    whether the caller holds {@code ADMIN}
+     * @return one entry per outbox row written for the order; payloads are not included
+     * @throws NotFoundException when it does not exist, or belongs to somebody else
+     */
+    @Transactional(readOnly = true)
+    public List<OrderEventResponse> events(UUID orderId, UUID callerId, boolean admin) {
+        get(orderId, callerId, admin);
+        return outbox.findByAggregateIdOrderByCreatedAtAsc(orderId).stream()
+                .map(OrderEventResponse::of)
+                .toList();
     }
 
     /**

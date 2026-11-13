@@ -25,7 +25,7 @@ final class PemKeys {
      */
     static RSAPrivateKey readPrivateKey(String pem) {
         try {
-            return (RSAPrivateKey) rsa().generatePrivate(new PKCS8EncodedKeySpec(der(pem)));
+            return (RSAPrivateKey) rsa().generatePrivate(new PKCS8EncodedKeySpec(der(resolvePem(pem))));
         } catch (InvalidKeySpecException | IllegalArgumentException e) {
             throw new IllegalStateException(
                     "auth.jwt.private-key (AUTH_JWT_PRIVATE_KEY) is not a valid PKCS#8 RSA PEM private key", e);
@@ -38,11 +38,32 @@ final class PemKeys {
      */
     static RSAPublicKey readPublicKey(String pem) {
         try {
-            return (RSAPublicKey) rsa().generatePublic(new X509EncodedKeySpec(der(pem)));
+            return (RSAPublicKey) rsa().generatePublic(new X509EncodedKeySpec(der(resolvePem(pem))));
         } catch (InvalidKeySpecException | IllegalArgumentException e) {
             throw new IllegalStateException(
                     "auth.jwt.public-key (AUTH_JWT_PUBLIC_KEY) is not a valid X.509 RSA PEM public key", e);
         }
+    }
+
+    private static String resolvePem(String value) {
+        if (value == null || value.isBlank()) {
+            return value;
+        }
+        String trimmed = value.strip();
+        if (trimmed.startsWith("-----BEGIN")) {
+            return trimmed;
+        }
+        if (!trimmed.contains("\n") && !trimmed.contains("\r")) {
+            try {
+                java.nio.file.Path path = java.nio.file.Path.of(trimmed);
+                if (java.nio.file.Files.isRegularFile(path)) {
+                    return java.nio.file.Files.readString(path);
+                }
+            } catch (Exception ignored) {
+                // Ignore and fall through to standard DER decoding to preserve safe generic errors
+            }
+        }
+        return trimmed;
     }
 
     private static KeyFactory rsa() {

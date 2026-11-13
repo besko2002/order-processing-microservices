@@ -1,0 +1,15 @@
+# Kafka Xms memory trial — INACTIVE EXPERIMENT (applied 2026-11-13, rolled back same day).
+# Changes exactly one setting: Kafka's initial heap reservation 256m -> 128m, keeping Xmx 512m.
+# Outcome: benefit UNSUPPORTED by available evidence — early measured RSS increased during the
+# trial (470.7 MiB @ 85s and 496.5 MiB @ 386s uptime vs pretrial 347.6-381.7 MiB @ ~3h uptime);
+# those figures are uptime/restart-confounded observations, not proof in either direction.
+# Retained only for a future SEPARATELY APPROVED trial: it must NOT be included in any composition
+# by default. If ever re-approved, layer it AFTER base + runtime-memory-preservation.yml (omit this
+# file to roll back to the 256m pin). Savings are NOT guaranteed: Xmx bounds only the heap, not
+# total RSS; a lower Xms lowers the initial reservation, but a grown heap or native usage can
+# offset it. Applying it recreates the Kafka container (a runtime change).
+
+services:
+  kafka:
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms128m"

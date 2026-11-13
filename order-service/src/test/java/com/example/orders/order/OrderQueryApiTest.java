@@ -7,7 +7,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * Reading orders, and who is allowed to.
@@ -17,6 +19,9 @@ import org.springframework.http.MediaType;
  * enumerating order ids.
  */
 class OrderQueryApiTest extends OrderIntegrationTest {
+
+    @Autowired
+    private JdbcTemplate jdbc;
 
     private UUID placeOrder(UUID user, UUID product, int quantity) throws Exception {
         String body = mvc.perform(post("/api/orders")
@@ -185,6 +190,76 @@ class OrderQueryApiTest extends OrderIntegrationTest {
     @Test
     void theAdminListNeedsAToken() throws Exception {
         mvc.perform(get("/api/orders"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    // ------------------------------------------------------------------ GET /api/orders/{id}/events
+
+    @Test
+    void theOwnerReadsTheEventsOfTheirOrderOldestFirstWithTheTraceId() throws Exception {
+        UUID product = givenCatalogProduct("SKU-EV1", "Events one", "11.00");
+        UUID user = UUID.randomUUID();
+        UUID orderId = placeOrder(user, product, 1);
+
+        mvc.perform(get("/api/orders/" + orderId + "/events")
+                        .header("Authorization", "Bearer " + token(user, "USER")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].eventType").value("OrderCreated"))
+                .andExpect(jsonPath("$[0].topic").value("order.events"))
+                .andExpect(jsonPath("$[0].createdAt").isNotEmpty())
+                .andExpect(jsonPath("$[0].attempts").isNumber())
+                .andExpect(jsonPath("$[0].payload").doesNotExist());
+    }
+
+    @Test
+    void anEventRowCarriesTheTraceIdParsedFromItsTraceparent() throws Exception {
+        UUID product = givenCatalogProduct("SKU-EV2", "Events two", "11.00");
+        UUID user = UUID.randomUUID();
+        UUID orderId = placeOrder(user, product, 1);
+        // traceparent is written once by the outbox writer and never updated through JPA, so the
+        // test stamps the row directly, as the writer would have done inside the transaction.
+        jdbc.update("UPDATE outbox_events SET traceparent = ? WHERE aggregate_id = ?",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", orderId);
+
+        mvc.perform(get("/api/orders/" + orderId + "/events")
+                        .header("Authorization", "Bearer " + token(user, "USER")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].traceId").value("4bf92f3577b34da6a3ce929d0e0e4736"));
+    }
+
+    @Test
+    void anAdminReadsTheEventsOfAnyOrder() throws Exception {
+        UUID product = givenCatalogProduct("SKU-EV3", "Events three", "11.00");
+        UUID orderId = placeOrder(UUID.randomUUID(), product, 1);
+
+        mvc.perform(get("/api/orders/" + orderId + "/events")
+                        .header("Authorization", "Bearer " + adminToken()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].eventType").value("OrderCreated"));
+    }
+
+    @Test
+    void anotherUsersOrderEventsAre404() throws Exception {
+        UUID product = givenCatalogProduct("SKU-EV4", "Events four", "11.00");
+        UUID orderId = placeOrder(UUID.randomUUID(), product, 1);
+
+        mvc.perform(get("/api/orders/" + orderId + "/events")
+                        .header("Authorization", "Bearer " + userToken()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.status").value(404));
+    }
+
+    @Test
+    void theEventsOfAnUnknownOrderAre404() throws Exception {
+        mvc.perform(get("/api/orders/" + UUID.randomUUID() + "/events")
+                        .header("Authorization", "Bearer " + userToken()))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void readingOrderEventsWithoutATokenIs401() throws Exception {
+        mvc.perform(get("/api/orders/" + UUID.randomUUID() + "/events"))
                 .andExpect(status().isUnauthorized());
     }
 }

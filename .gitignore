@@ -35,6 +35,9 @@ build/
 .env
 *.log
 logs/
+secrets/
+*.pem
+*.key
 
 # local run artifacts
 e2e-logs/
