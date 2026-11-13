@@ -1,0 +1,68 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: auth-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${AUTH_DB_NAME:auth_db}
+    username: ${AUTH_DB_USER:auth_user}
+    password: ${AUTH_DB_PASSWORD:auth_pass}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+auth:
+  jwt:
+    issuer: ${AUTH_JWT_ISSUER:order-processing-auth}
+    # ISO-8601 duration, e.g. PT1H, PT30M, PT15S.
+    expiration: ${AUTH_JWT_EXPIRATION:PT1H}
+    # Leave the three key settings empty for local development: the service then
+    # generates a throw-away 2048-bit RSA pair at startup and logs a WARN.
+    # In any shared environment set both PEM keys (PKCS#8 private / X.509 public).
+    key-id: ${AUTH_JWT_KEY_ID:}
+    private-key: ${AUTH_JWT_PRIVATE_KEY:}
+    public-key: ${AUTH_JWT_PUBLIC_KEY:}
+  admin:
+    email: ${AUTH_ADMIN_EMAIL:admin@orders.local}
+    password: ${AUTH_ADMIN_PASSWORD:Admin@12345}
+    name: ${AUTH_ADMIN_NAME:Platform Admin}
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus}
+  endpoint:
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}

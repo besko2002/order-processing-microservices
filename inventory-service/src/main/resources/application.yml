@@ -1,0 +1,116 @@
+server:
+  port: ${SERVER_PORT:8083}
+
+spring:
+  application:
+    name: inventory-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${INVENTORY_DB_NAME:inventory_db}
+    username: ${INVENTORY_DB_USER:inventory_user}
+    password: ${INVENTORY_DB_PASSWORD:inventory_pass}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:inventory-service}
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:earliest}
+      enable-auto-commit: false
+      # Raw strings: service-support's EventEnvelopeReader picks the payload type from the eventType
+      # header, so a malformed record becomes a classifiable failure instead of a deserialisation
+      # error inside the container.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+
+# ---------------------------------------------------------------- reliability (service-support)
+# Tables: V3__outbox_and_processed_events.sql in this service's own database.
+outbox:
+  enabled: true
+  # Rows are about the stock a given order holds; aggregate_id stays the order id, so all messages
+  # about one order share a Kafka partition.
+  aggregate-type: StockReservation
+  poll-interval-ms: ${OUTBOX_POLL_MS:500}
+  batch-size: ${OUTBOX_BATCH_SIZE:50}
+  send-timeout: ${OUTBOX_SEND_TIMEOUT:PT15S}
+  retention: ${OUTBOX_RETENTION:P7D}
+  cleanup-interval-ms: ${OUTBOX_CLEANUP_MS:3600000}
+  scheduler-enabled: ${OUTBOX_SCHEDULER_ENABLED:true}
+  producer:
+    max-block-ms: ${OUTBOX_PRODUCER_MAX_BLOCK_MS:5000}
+    request-timeout-ms: ${OUTBOX_PRODUCER_REQUEST_TIMEOUT_MS:5000}
+    delivery-timeout-ms: ${OUTBOX_PRODUCER_DELIVERY_TIMEOUT_MS:10000}
+
+idempotency:
+  enabled: true
+  retention: ${PROCESSED_EVENTS_RETENTION:P7D}
+  cleanup-interval-ms: ${PROCESSED_EVENTS_CLEANUP_MS:3600000}
+
+messaging:
+  consumer:
+    enabled: true
+    concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+    retries: ${KAFKA_CONSUMER_RETRIES:3}
+    initial-backoff-ms: ${KAFKA_CONSUMER_BACKOFF_MS:500}
+    backoff-multiplier: ${KAFKA_CONSUMER_BACKOFF_MULTIPLIER:2.0}
+    max-backoff-ms: ${KAFKA_CONSUMER_MAX_BACKOFF_MS:4000}
+
+inventory:
+  # Insert a handful of demo products at startup (idempotent, matched by SKU). Off by default so
+  # tests and shared environments stay clean; .env.example turns it on for local development.
+  seed-demo: ${INVENTORY_SEED_DEMO:false}
+  reservation:
+    # Attempts per reserve/release/commit before an optimistic-locking conflict is given up on.
+    max-attempts: ${INVENTORY_RESERVATION_MAX_ATTEMPTS:3}
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.kafka.listener: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus}
+  endpoint:
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    # Spring Boot splices this into the default console pattern, so every log line carries the
+    # correlation id the gateway generated (service-support puts it in the MDC).
+    correlation: "[${spring.application.name:inventory-service},%X{correlationId:-},%X{traceId:-}] "

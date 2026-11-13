@@ -1,0 +1,88 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6380}
+      # Deliberately short: the rate limiter fails open, so a dead Redis must cost every
+      # request a few hundred milliseconds at most, not the Lettuce default of 10s.
+      timeout: ${REDIS_TIMEOUT:500ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:500ms}
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # Every route below is an /api/** route, so the rate limiter belongs on all of them.
+          # The key is resolved by UserOrIpKeyResolver (user id when authenticated, else client IP);
+          # buckets are per route and per key.
+          default-filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: ${RATE_LIMIT_REPLENISH_RATE:10}
+                redis-rate-limiter.burstCapacity: ${RATE_LIMIT_BURST_CAPACITY:20}
+                redis-rate-limiter.requestedTokens: ${RATE_LIMIT_REQUESTED_TOKENS:1}
+          routes:
+            - id: auth-service
+              uri: ${AUTH_SERVICE_URI:http://localhost:8081}
+              predicates:
+                - Path=/api/auth/**
+            - id: order-service
+              uri: ${ORDER_SERVICE_URI:http://localhost:8082}
+              predicates:
+                - Path=/api/orders/**
+            - id: inventory-service
+              uri: ${INVENTORY_SERVICE_URI:http://localhost:8083}
+              predicates:
+                - Path=/api/products/**,/api/inventory/**
+            - id: payment-service
+              uri: ${PAYMENT_SERVICE_URI:http://localhost:8084}
+              predicates:
+                - Path=/api/payments/**
+            - id: notification-service
+              uri: ${NOTIFICATION_SERVICE_URI:http://localhost:8085}
+              predicates:
+                - Path=/api/notifications/**
+
+gateway:
+  security:
+    # Public keys of auth-service; fetched lazily and cached, so start order does not matter.
+    jwks-uri: ${AUTH_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    issuer: ${AUTH_JWT_ISSUER:order-processing-auth}
+  cors:
+    allowed-origins: ${GATEWAY_CORS_ORIGINS:http://localhost:5173}
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus,gateway}
+  endpoint:
+    gateway:
+      # Exposes /actuator/gateway/routes for inspecting the routing table; ADMIN only.
+      access: ${MANAGEMENT_GATEWAY_ENDPOINT_ACCESS:unrestricted}
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+    org.springframework.cloud.gateway: ${LOG_LEVEL_GATEWAY:INFO}

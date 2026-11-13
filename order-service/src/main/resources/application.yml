@@ -1,0 +1,163 @@
+server:
+  port: ${SERVER_PORT:8082}
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${ORDER_DB_NAME:order_db}
+    username: ${ORDER_DB_USER:order_user}
+    password: ${ORDER_DB_PASSWORD:order_pass}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        # The paged order lists do not join-fetch their lines (a collection fetch plus LIMIT
+        # forces in-memory pagination); this loads the lines of a whole page in one extra query.
+        default_batch_fetch_size: 32
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:order-service}
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:earliest}
+      enable-auto-commit: false
+      # The saga listeners read raw strings and parse the envelope themselves (service-support's
+      # EventEnvelopeReader picks the payload type from the eventType header), so a malformed record
+      # becomes a classifiable business failure instead of a deserialisation error thrown inside the
+      # container.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+
+# ---------------------------------------------------------------- reliability (service-support)
+# The outbox, the idempotent-consumer log and the retry/dead-letter handling all live in
+# service-support and are opt-in; this service uses all three. The tables are its own
+# (V2__create_orders.sql, V3__saga.sql).
+outbox:
+  enabled: true
+  # Written into outbox_events.aggregate_type: every row this service produces is about an order.
+  aggregate-type: Order
+  # How often the relay looks for events to publish. Short, because this is the latency between
+  # "order accepted" and "the saga starts".
+  poll-interval-ms: ${OUTBOX_POLL_MS:500}
+  # Rows claimed per poll with FOR UPDATE SKIP LOCKED. The locks are held for the whole batch,
+  # so the batch stays small enough that a stuck broker cannot block other instances for long.
+  batch-size: ${OUTBOX_BATCH_SIZE:50}
+  # How long the relay waits for one send result. Larger than delivery-timeout-ms below, so the
+  # producer always resolves the future itself instead of us giving up on a record still in
+  # flight (which would risk a duplicate on the topic).
+  send-timeout: ${OUTBOX_SEND_TIMEOUT:PT15S}
+  # Published rows are the audit trail of what this service announced; kept this long, then
+  # dropped so the queue table does not turn into an archive.
+  retention: ${OUTBOX_RETENTION:P7D}
+  cleanup-interval-ms: ${OUTBOX_CLEANUP_MS:3600000}
+  # Turned off in tests that drive the relay by hand.
+  scheduler-enabled: ${OUTBOX_SCHEDULER_ENABLED:true}
+  producer:
+    max-block-ms: ${OUTBOX_PRODUCER_MAX_BLOCK_MS:5000}
+    request-timeout-ms: ${OUTBOX_PRODUCER_REQUEST_TIMEOUT_MS:5000}
+    delivery-timeout-ms: ${OUTBOX_PRODUCER_DELIVERY_TIMEOUT_MS:10000}
+
+idempotency:
+  enabled: true
+  retention: ${PROCESSED_EVENTS_RETENTION:P7D}
+  cleanup-interval-ms: ${PROCESSED_EVENTS_CLEANUP_MS:3600000}
+
+messaging:
+  consumer:
+    enabled: true
+    # One thread: the key is the order id, so ordering per order already comes from the partition.
+    concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+    # Then the record goes to <topic>.DLT. Four attempts over ~3.5s is enough for a blip; anything
+    # longer is an outage that a human has to see.
+    retries: ${KAFKA_CONSUMER_RETRIES:3}
+    initial-backoff-ms: ${KAFKA_CONSUMER_BACKOFF_MS:500}
+    backoff-multiplier: ${KAFKA_CONSUMER_BACKOFF_MULTIPLIER:2.0}
+    max-backoff-ms: ${KAFKA_CONSUMER_MAX_BACKOFF_MS:4000}
+
+orders:
+  saga:
+    # An order whose current step produced no answer within this window is cancelled with
+    # compensation. Generous: the saga normally completes in milliseconds, and cancelling an order
+    # that was merely slow is itself a failure.
+    timeout: ${ORDER_SAGA_TIMEOUT:PT2M}
+    sweep-interval-ms: ${ORDER_SAGA_SWEEP_MS:15000}
+    timeout-sweeper-enabled: ${ORDER_SAGA_SWEEPER_ENABLED:true}
+    # Attempts per saga step before an optimistic-locking conflict is given up on.
+    max-attempts: ${ORDER_SAGA_MAX_ATTEMPTS:3}
+
+# Price snapshots are taken from inventory-service over HTTP, guarded by a circuit breaker and a
+# retry. Only InventoryCallFailedException (a timeout, a dropped connection or a 5xx) counts: an
+# unknown product is a 404 the caller caused, and it must neither be retried nor push the breaker
+# towards opening.
+resilience4j:
+  circuitbreaker:
+    instances:
+      inventory:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: ${INVENTORY_CB_WINDOW:20}
+        minimum-number-of-calls: ${INVENTORY_CB_MINIMUM_CALLS:10}
+        failure-rate-threshold: ${INVENTORY_CB_FAILURE_RATE:50}
+        wait-duration-in-open-state: ${INVENTORY_CB_OPEN_WAIT:10s}
+        permitted-number-of-calls-in-half-open-state: ${INVENTORY_CB_HALF_OPEN_CALLS:3}
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+        record-exceptions:
+          - com.example.orders.order.client.InventoryCallFailedException
+  retry:
+    instances:
+      inventory:
+        max-attempts: ${INVENTORY_RETRY_MAX_ATTEMPTS:3}
+        wait-duration: ${INVENTORY_RETRY_WAIT:200ms}
+        retry-exceptions:
+          - com.example.orders.order.client.InventoryCallFailedException
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.kafka.listener: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus}
+  endpoint:
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    # Spring Boot splices this into the default console pattern, so every log line carries the
+    # correlation id the gateway generated (service-support puts it in the MDC).
+    correlation: "[${spring.application.name:order-service},%X{correlationId:-},%X{traceId:-}] "

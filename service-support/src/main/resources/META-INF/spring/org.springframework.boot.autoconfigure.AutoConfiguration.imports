@@ -1,0 +1,7 @@
+com.example.orders.support.error.ServiceErrorAutoConfiguration
+com.example.orders.support.correlation.CorrelationIdAutoConfiguration
+com.example.orders.support.security.ServiceSecurityAutoConfiguration
+com.example.orders.support.outbox.OutboxAutoConfiguration
+com.example.orders.support.idempotency.IdempotencyAutoConfiguration
+com.example.orders.support.messaging.EventConsumerAutoConfiguration
+com.example.orders.support.docs.OpenApiAutoConfiguration

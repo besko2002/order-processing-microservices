@@ -1,0 +1,28 @@
+# Scrapes the six services' /actuator/prometheus.
+# "host" = services started with java -jar on the host machine (the usual dev setup);
+# "docker" = services started with `docker compose --profile app`.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: services-host
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - host.docker.internal:8080
+          - host.docker.internal:8081
+          - host.docker.internal:8082
+          - host.docker.internal:8083
+          - host.docker.internal:8084
+          - host.docker.internal:8085
+  - job_name: services-docker
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - api-gateway:8080
+          - auth-service:8081
+          - order-service:8082
+          - inventory-service:8083
+          - payment-service:8084
+          - notification-service:8085

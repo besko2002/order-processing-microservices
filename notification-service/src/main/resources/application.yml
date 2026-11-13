@@ -1,0 +1,92 @@
+server:
+  port: ${SERVER_PORT:8085}
+
+spring:
+  application:
+    name: notification-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${NOTIFICATION_DB_NAME:notification_db}
+    username: ${NOTIFICATION_DB_USER:notification_user}
+    password: ${NOTIFICATION_DB_PASSWORD:notification_pass}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:notification-service}
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:earliest}
+      enable-auto-commit: false
+      # Raw strings: service-support's EventEnvelopeReader resolves the payload type itself.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+  mail:
+    # MailHog in development (docker compose): SMTP 1025, web UI http://localhost:8025
+    host: ${MAIL_HOST:localhost}
+    port: ${MAIL_PORT:1025}
+
+# ---------------------------------------------------------------- reliability (service-support)
+idempotency:
+  enabled: true
+  retention: ${PROCESSED_EVENTS_RETENTION:P7D}
+  cleanup-interval-ms: ${PROCESSED_EVENTS_CLEANUP_MS:3600000}
+
+messaging:
+  consumer:
+    enabled: true
+    concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+    retries: ${KAFKA_CONSUMER_RETRIES:3}
+    initial-backoff-ms: ${KAFKA_CONSUMER_BACKOFF_MS:500}
+    backoff-multiplier: ${KAFKA_CONSUMER_BACKOFF_MULTIPLIER:2.0}
+    max-backoff-ms: ${KAFKA_CONSUMER_MAX_BACKOFF_MS:4000}
+
+notifications:
+  # Order events carry the customer id only (no email address), so in this demo every mail goes to
+  # <customerId>@<recipient-domain> and can be inspected in MailHog.
+  from: ${NOTIFICATION_FROM:orders@orders.local}
+  recipient-domain: ${NOTIFICATION_RECIPIENT_DOMAIN:customers.orders.local}
+  email-enabled: ${NOTIFICATION_EMAIL_ENABLED:true}
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.kafka.listener: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus}
+  endpoint:
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    correlation: "[${spring.application.name:notification-service},%X{correlationId:-},%X{traceId:-}] "

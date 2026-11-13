@@ -1,0 +1,9 @@
+target/
+**/target/
+.git/
+.idea/
+.vscode/
+.env
+*.log
+.DS_Store
+e2e-logs/
