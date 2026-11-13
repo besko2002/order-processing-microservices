@@ -1,5 +1,9 @@
-# Phase 1: infrastructure only. The six Spring Boot services still run on the host
-# (see README.md); they get containerised in phase 8.
+# Profiles:
+#   (none)         Postgres, Kafka, Redis, MailHog. The six Spring Boot services then run on
+#                  the host (see README.md).
+#   app            the six services as containers (docker compose --profile app up -d --build).
+#   observability  Jaeger, Prometheus, Grafana. Add it to "app" and set
+#                  OTLP_TRACING_EXPORT_ENABLED=true to also send the containers' traces to Jaeger.
 #
 # Host ports are deliberately off the usual defaults (5433/6379/5000/7000 are taken on
 # this machine): Postgres 5435, Kafka 9094, Redis 6380, MailHog 1025/8025.
@@ -18,6 +22,12 @@ x-app-env: &app-env
   REDIS_HOST: redis
   REDIS_PORT: 6379
   AUTH_JWKS_URI: http://auth-service:8081/.well-known/jwks.json
+  # Jaeger only exists under the "observability" profile and compose cannot react to a profile, so
+  # span export is an explicit opt-in. Off, an exporter with no collector logs an ERROR per batch;
+  # tracing itself (trace ids in the logs, traceparent on Kafka) stays on either way. Turn it on with
+  #   OTLP_TRACING_EXPORT_ENABLED=true docker compose --profile app --profile observability up -d
+  # (or put it in .env). Changing it recreates the six service containers.
+  OTLP_TRACING_EXPORT_ENABLED: ${OTLP_TRACING_EXPORT_ENABLED:-false}
   OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
   JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70"
 
@@ -195,6 +205,7 @@ services:
 
   # ------------------------------------------------------------------ observability
   # docker compose --profile observability up -d   →  Grafana :3000, Prometheus :9090, Jaeger :16686
+  # Containerised services only send traces here with OTLP_TRACING_EXPORT_ENABLED=true (see x-app-env).
   jaeger:
     image: jaegertracing/all-in-one:1.72.0
     container_name: op-jaeger

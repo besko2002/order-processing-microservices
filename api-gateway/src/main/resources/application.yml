@@ -61,6 +61,10 @@ management:
       probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
   otlp:
     tracing:
+      # Only the span export is switchable; tracing itself (trace ids, propagation) stays on.
+      # docker-compose.yml turns it off for the containers unless Jaeger is wanted.
+      export:
+        enabled: ${OTLP_TRACING_EXPORT_ENABLED:true}
       endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
   metrics:
     tags:

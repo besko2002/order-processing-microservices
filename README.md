@@ -133,9 +133,26 @@ Metrics, traces and logs are wired into every service:
   `[order-service,<correlationId>,<traceId>]`.
 - **Grafana** — a provisioned "Order Processing — Overview" dashboard (opens as the home page).
 
+Tracing itself — the trace id in every log line, the `traceparent` context across Kafka and the
+outbox — is always on. Only the **export** of finished spans to Jaeger can be switched, with
+`OTLP_TRACING_EXPORT_ENABLED` (Spring Boot's `management.otlp.tracing.export.enabled`):
+
+| Services run… | Default | Why |
+|---|---|---|
+| on the host | `true` (spans go to `localhost:4318`) | Jaeger publishes that port when the `observability` profile is up |
+| in Docker (`--profile app`) | `false` | Jaeger is not part of that profile, and an exporter with no collector logs `ERROR … Failed to export spans` on every batch |
+
 ```bash
-docker compose --profile observability up -d --build   # Grafana :3000, Prometheus :9090, Jaeger :16686
+# Grafana :3000, Prometheus :9090, Jaeger :16686 — services running on the host export to it by default
+docker compose --profile observability up -d --build
+
+# Services in Docker + observability: switch the export on so the containers' spans reach Jaeger
+OTLP_TRACING_EXPORT_ENABLED=true docker compose --profile app --profile observability up -d --build
 ```
+
+Without `OTLP_TRACING_EXPORT_ENABLED=true` the second command still starts Jaeger, Prometheus and
+Grafana (metrics work), but the containers send no spans. Compose recreates the six service
+containers when the variable changes; put it in `.env` to make it permanent.
 
 **One order traced across five services (Jaeger)**
 
@@ -161,6 +178,9 @@ Requirements: JDK 21 and Docker (sized for Docker Desktop with ~4 GB).
 docker compose --profile app up -d --build
 ```
 
+This starts no Jaeger and exports no spans, so the logs carry no exporter errors (trace ids are
+still in every line). To trace into Jaeger as well, see [Observability](#observability).
+
 **Infrastructure in Docker, services on the host** (handy while developing):
 
 ```bash
@@ -173,6 +193,9 @@ java -jar payment-service/target/payment-service-0.0.1-SNAPSHOT.jar &
 java -jar notification-service/target/notification-service-0.0.1-SNAPSHOT.jar &
 java -jar api-gateway/target/api-gateway-0.0.1-SNAPSHOT.jar &
 ```
+
+Services on the host export spans to `localhost:4318` (Jaeger, `--profile observability`). Without
+Jaeger, start them with `OTLP_TRACING_EXPORT_ENABLED=false` to keep exporter errors out of the logs.
 
 | What | Where |
 |---|---|
