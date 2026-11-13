@@ -112,7 +112,10 @@ class DeadLetterTopicTest extends SupportIntegrationTest {
     void aWellFormedRecordIsHandledOnceAndNeverDeadLettered() {
         publish(GOOD_KEY, envelopeJson());
 
-        awaitUntil(Duration.ofSeconds(30), () -> listener.deliveriesOf(GOOD_KEY) == 1);
+        // Wait for the handler's final effect, not the delivery counter: the counter is bumped before
+        // the handler finishes, so asserting on it alone can read `handled` before it is appended.
+        awaitUntil(Duration.ofSeconds(30), () -> listener.handled().contains(GOOD_KEY + ":OrderCreated"));
+        assertThat(listener.deliveriesOf(GOOD_KEY)).isEqualTo(1);
         assertThat(listener.handled()).contains(GOOD_KEY + ":OrderCreated");
         // Give the (non-existent) dead letter a chance to appear before claiming it did not.
         assertThat(findDeadLetter(GOOD_KEY, Duration.ofSeconds(3))).isNull();
