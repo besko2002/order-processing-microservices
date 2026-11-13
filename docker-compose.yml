@@ -1,7 +1,7 @@
 # Profiles:
 #   (none)         Postgres, Kafka, Redis, MailHog. The six Spring Boot services then run on
 #                  the host (see README.md).
-#   app            the six services as containers, plus the web UI on http://localhost:5173
+#   app            the six services as containers
 #                  (docker compose --profile app up -d --build).
 #   observability  Jaeger, Prometheus, Grafana. Add it to "app" and set
 #                  OTLP_TRACING_EXPORT_ENABLED=true to also send the containers' traces to Jaeger.
@@ -206,15 +206,6 @@ services:
       NOTIFICATION_SERVICE_URI: http://notification-service:8085
     ports: ["8080:8080"]
     depends_on: { redis: { condition: service_healthy }, auth-service: { condition: service_healthy } }
-
-  frontend:
-    <<: *app
-    build: { context: ./frontend }
-    image: order-processing/frontend:local
-    container_name: op-frontend
-    ports: ["5173:80"]
-    depends_on: { api-gateway: { condition: service_healthy } }
-    mem_limit: 64m
 
   # ------------------------------------------------------------------ observability
   # docker compose --profile observability up -d   →  Grafana :3000, Prometheus :9090, Jaeger :16686

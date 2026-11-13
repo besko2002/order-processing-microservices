@@ -206,20 +206,6 @@ Jaeger, start them with `OTLP_TRACING_EXPORT_ENABLED=false` to keep exporter err
 
 Host ports avoid common defaults: Postgres **5435**, Kafka **9094**, Redis **6380**.
 
-## Web UI
-
-A React app in `frontend/` lets you watch the saga end to end: browse products, check out, see each
-order's progress step by step (placed, stock reserved, payment, confirmed, or the failure branch), and
-read the payment and notification records.
-
-- **Dev:** with the services up (`docker compose up -d` plus the six apps), run
-  `cd frontend && npm install && npm run dev`, then open http://localhost:5173. Requests to `/api` are
-  proxied to the gateway on `localhost:8080`.
-- **Docker:** `docker compose --profile app up -d --build` also starts the UI, served at
-  http://localhost:5173.
-- **Admin login:** `admin@orders.local` / `Admin@12345` for the all-orders, product and reservation pages.
-  Any other account registered in the UI is a normal user.
-
 ## Try the flow
 
 ```bash
