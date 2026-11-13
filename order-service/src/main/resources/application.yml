@@ -100,6 +100,13 @@ orders:
     timeout: ${ORDER_SAGA_TIMEOUT:PT2M}
     sweep-interval-ms: ${ORDER_SAGA_SWEEP_MS:15000}
     timeout-sweeper-enabled: ${ORDER_SAGA_SWEEPER_ENABLED:true}
+    # A refund whose command was never answered is re-commanded after this interval, measured
+    # from the last attempt (the first command or the previous recovery). Deliberately much
+    # shorter than the order timeout: re-commanding a refund is safe (payment-service refunds
+    # exactly once per order), stranding one is not. The two settings are independent, though:
+    # the timeout scan never touches an order with an outstanding refund, so only this interval
+    # paces the retries, whichever of the two is longer.
+    refund-retry-interval: ${ORDER_SAGA_REFUND_RETRY_INTERVAL:PT30S}
     # Attempts per saga step before an optimistic-locking conflict is given up on.
     max-attempts: ${ORDER_SAGA_MAX_ATTEMPTS:3}
 

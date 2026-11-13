@@ -54,8 +54,12 @@ messaging:
     max-backoff-ms: ${KAFKA_CONSUMER_MAX_BACKOFF_MS:4000}
 
 notifications:
-  # Order events carry the customer id only (no email address), so in this demo every mail goes to
-  # <customerId>@<recipient-domain> and can be inspected in MailHog.
+  # DEMO-ONLY email. Order events carry the customer id only (no email address), and no event
+  # payload is trusted with a recipient — so in this demo every mail goes to the synthetic address
+  # <customerId>@<recipient-domain> and lands in MailHog, never in a real person's inbox. Wiring a
+  # verified customer-address source is a deliberate future change, not a config knob. Delivery is
+  # at-least-once even though the send happens in the same transaction as the dedup record: a crash
+  # after SMTP success but before the commit means the redelivery sends again.
   from: ${NOTIFICATION_FROM:orders@orders.local}
   recipient-domain: ${NOTIFICATION_RECIPIENT_DOMAIN:customers.orders.local}
   email-enabled: ${NOTIFICATION_EMAIL_ENABLED:true}

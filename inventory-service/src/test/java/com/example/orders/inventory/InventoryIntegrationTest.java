@@ -23,7 +23,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Supplier;
 import okhttp3.mockwebserver.Dispatcher;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
@@ -46,7 +50,12 @@ import org.testcontainers.utility.DockerImageName;
  * auth-service's JWKS endpoint, with an RSA key generated in-process — the same approach as the
  * gateway tests, so these tests never need a running auth-service.
  *
- * <p>Containers and stub are started once per JVM from a static initialiser rather than per class,
+ * <p>A second stub stands in for order-service's {@code GET /api/orders/{id}}, which the operator
+ * reconciliation asks before it releases anything. It answers {@code 404} for every order nobody
+ * stubbed, records every lookup (order id and the {@code Authorization} header it carried) and is
+ * reset before each test — it is plain in-memory state, so resetting it races no worker.
+ *
+ * <p>Containers and stubs are started once per JVM from a static initialiser rather than per class,
  * and every subclass shares the same Spring context: Docker Desktop on this machine has ~4 GB.
  */
 @SpringBootTest
@@ -66,6 +75,23 @@ abstract class InventoryIntegrationTest {
 
     @SuppressWarnings("resource")
     protected static final MockWebServer JWKS_STUB = new MockWebServer();
+
+    /** Stands in for order-service; see {@link #stubOrderStatus} and {@link #orderLookups()}. */
+    @SuppressWarnings("resource")
+    protected static final MockWebServer ORDER_STUB = new MockWebServer();
+
+    private static final Map<UUID, Supplier<MockResponse>> ORDER_ANSWERS = new ConcurrentHashMap<>();
+
+    private static final List<OrderLookup> ORDER_LOOKUPS = new CopyOnWriteArrayList<>();
+
+    /**
+     * One request the inventory service sent to the stubbed order-service.
+     *
+     * @param orderId       order asked about
+     * @param authorization the {@code Authorization} header it carried, {@code null} when absent
+     */
+    protected record OrderLookup(UUID orderId, String authorization) {
+    }
 
     @SuppressWarnings("resource")
     private static final PostgreSQLContainer<?> POSTGRES =
@@ -97,6 +123,32 @@ abstract class InventoryIntegrationTest {
         catch (IOException e) {
             throw new UncheckedIOException("Could not start the JWKS stub", e);
         }
+        ORDER_STUB.setDispatcher(new Dispatcher() {
+            @Override
+            public MockResponse dispatch(RecordedRequest request) {
+                String path = request.getPath() == null ? "" : request.getPath();
+                String prefix = "/api/orders/";
+                if (!"GET".equals(request.getMethod()) || !path.startsWith(prefix)) {
+                    return new MockResponse().setResponseCode(404);
+                }
+                UUID orderId;
+                try {
+                    orderId = UUID.fromString(path.substring(prefix.length()));
+                }
+                catch (IllegalArgumentException e) {
+                    return new MockResponse().setResponseCode(400);
+                }
+                ORDER_LOOKUPS.add(new OrderLookup(orderId, request.getHeader("Authorization")));
+                Supplier<MockResponse> answer = ORDER_ANSWERS.get(orderId);
+                return answer == null ? new MockResponse().setResponseCode(404) : answer.get();
+            }
+        });
+        try {
+            ORDER_STUB.start();
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException("Could not start the order-service stub", e);
+        }
     }
 
     @DynamicPropertySource
@@ -109,6 +161,9 @@ abstract class InventoryIntegrationTest {
         registry.add("spring.datasource.hikari.maximum-pool-size", () -> 16);
         registry.add("AUTH_JWKS_URI", () -> "http://localhost:" + JWKS_STUB.getPort() + JWKS_PATH);
         registry.add("AUTH_JWT_ISSUER", () -> ISSUER);
+        registry.add("ORDER_BASE_URL", () -> "http://localhost:" + ORDER_STUB.getPort());
+        // Short, so a timed-out lookup costs a test well under a second instead of the production 2 s.
+        registry.add("ORDER_READ_TIMEOUT_MS", () -> 700);
         registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
         // Keep the relay lively so a test does not wait half a second for every event it asserts on.
         registry.add("OUTBOX_POLL_MS", () -> 250);
@@ -137,6 +192,33 @@ abstract class InventoryIntegrationTest {
     void resetDatabase() {
         reservations.deleteAllInBatch();
         products.deleteAllInBatch();
+        ORDER_ANSWERS.clear();
+        ORDER_LOOKUPS.clear();
+    }
+
+    /**
+     * @param orderId order the stubbed order-service knows
+     * @param status  the status it reports (any string, so tests can also send unknown ones)
+     */
+    protected static void stubOrderStatus(UUID orderId, String status) {
+        stubOrderAnswer(orderId, () -> new MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody("{\"id\":\"%s\",\"status\":\"%s\",\"orderNumber\":\"ORD-STUB\"}"
+                        .formatted(orderId, status)));
+    }
+
+    /**
+     * @param orderId order the stubbed order-service answers for
+     * @param answer  builds the (fresh) response for each lookup
+     */
+    protected static void stubOrderAnswer(UUID orderId, Supplier<MockResponse> answer) {
+        ORDER_ANSWERS.put(orderId, answer);
+    }
+
+    /** @return every lookup the stubbed order-service has received since the test began, in order */
+    protected static List<OrderLookup> orderLookups() {
+        return List.copyOf(ORDER_LOOKUPS);
     }
 
     /**

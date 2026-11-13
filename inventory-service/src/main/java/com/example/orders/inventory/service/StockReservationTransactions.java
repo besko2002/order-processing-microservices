@@ -1,6 +1,7 @@
 package com.example.orders.inventory.service;
 
 import com.example.orders.common.events.OrderItem;
+import com.example.orders.inventory.domain.OrderReleaseIntentRepository;
 import com.example.orders.inventory.domain.Product;
 import com.example.orders.inventory.domain.ProductRepository;
 import com.example.orders.inventory.domain.ReservationStatus;
@@ -24,18 +25,40 @@ import org.springframework.transaction.annotation.Transactional;
  * {@link StockReservationService} can retry a whole attempt on a fresh transaction after a lost
  * optimistic-locking race. Keeping it in a separate bean is not decoration — a retry around a
  * self-invoked {@code @Transactional} method would replay inside the already-failed transaction.
+ *
+ * <p><b>Per-order serialization and cancellation live here, in the shared primitives</b> — not in
+ * the Kafka handlers that call them. Every reserve, release, commit and reconciliation first takes
+ * the order's advisory lock ({@link SagaOrderLocks}) and only then reads reservation rows, so no
+ * caller (a saga handler, a direct {@link StockReservationService} call, the operator tool) can
+ * decide on rows another transaction is about to change. Every release records the order's
+ * durable {@code order_release_intents} row in the same commit, and every reserve refuses an order
+ * that has one — whichever path asked.
  */
 @Component
 public class StockReservationTransactions {
 
     private static final Logger log = LoggerFactory.getLogger(StockReservationTransactions.class);
 
+    /** Reason stored with the release intent when a release does not name one. */
+    static final String DEFAULT_RELEASE_REASON = "Stock released";
+
+    /** Column length of {@code order_release_intents.reason}. */
+    private static final int MAX_REASON_LENGTH = 500;
+
     private final ProductRepository products;
     private final StockReservationRepository reservations;
+    private final OrderReleaseIntentRepository releaseIntents;
+    private final SagaOrderLocks sagaOrderLocks;
 
-    StockReservationTransactions(ProductRepository products, StockReservationRepository reservations) {
+    StockReservationTransactions(
+            ProductRepository products,
+            StockReservationRepository reservations,
+            OrderReleaseIntentRepository releaseIntents,
+            SagaOrderLocks sagaOrderLocks) {
         this.products = products;
         this.reservations = reservations;
+        this.releaseIntents = releaseIntents;
+        this.sagaOrderLocks = sagaOrderLocks;
     }
 
     /**
@@ -68,12 +91,18 @@ public class StockReservationTransactions {
     }
 
     /**
-     * @param orderId order whose holds should go back on the shelf, inside the caller's transaction
+     * Gives the order's stock back and records its release intent, inside the caller's transaction.
+     * The intent is written for every outcome — released now, released before, or never reserved
+     * at all — so a later {@code OrderCreated} for this order can never hold stock.
+     *
+     * @param orderId order whose holds should go back on the shelf
+     * @param reason  what the release said; stored with the intent (first release wins), blank or
+     *                {@code null} falls back to a default, long text is cut to the column length
      * @return whether this call moved anything
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public ReservationTransition releaseWithin(UUID orderId) {
-        return transition(orderId, ReservationStatus.RELEASED);
+    public ReservationTransition releaseWithin(UUID orderId, String reason) {
+        return releaseAndRecordIntent(orderId, reason);
     }
 
     /**
@@ -85,7 +114,37 @@ public class StockReservationTransactions {
         return transition(orderId, ReservationStatus.COMMITTED);
     }
 
+    /**
+     * @param orderId order whose holds should go back on the shelf
+     * @return whether this call moved anything
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    ReservationTransition release(UUID orderId) {
+        return releaseAndRecordIntent(orderId, null);
+    }
+
+    /**
+     * @param orderId order whose holds are now a finished sale
+     * @return whether this call moved anything
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    ReservationTransition commit(UUID orderId) {
+        return transition(orderId, ReservationStatus.COMMITTED);
+    }
+
     private ReservationResult doReserve(UUID orderId, List<OrderItem> items) {
+        // Lock first, read second: everything below decides on rows no other step of this order
+        // can change until this transaction ends.
+        sagaOrderLocks.lockOrder(orderId);
+        if (releaseIntents.existsById(orderId)) {
+            // Cancelled (or released, or reconciled) before — possibly before this reservation was
+            // even asked for, which is why "no reservation rows" can never be enough. Checked
+            // ahead of the idempotency shortcut below on purpose: for a released order the rows
+            // that exist are RELEASED ones, and "already reserved" would announce a hold that was
+            // given back. Rejections are idempotent: replays keep landing here.
+            log.info("Order {} has a release intent, refusing to reserve stock for it", orderId);
+            return ReservationResult.alreadyReleased(orderId);
+        }
         List<StockReservation> existing = reservations.findByOrderIdOrderByCreatedAtAsc(orderId);
         if (!existing.isEmpty()) {
             // Idempotency: this order has been decided already. Re-reserving would double-book.
@@ -135,30 +194,83 @@ public class StockReservationTransactions {
     }
 
     /**
-     * @param orderId order whose holds should go back on the shelf
-     * @return whether this call moved anything
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    ReservationTransition release(UUID orderId) {
-        return transition(orderId, ReservationStatus.RELEASED);
-    }
-
-    /**
-     * @param orderId order whose holds are now a finished sale
-     * @return whether this call moved anything
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    ReservationTransition commit(UUID orderId) {
-        return transition(orderId, ReservationStatus.COMMITTED);
-    }
-
-    /**
      * @param orderId order to inspect
      * @return its reservation rows, oldest first
      */
     @Transactional(readOnly = true)
     List<StockReservation> findByOrder(UUID orderId) {
         return reservations.findByOrderIdOrderByCreatedAtAsc(orderId);
+    }
+
+    /**
+     * One order of the operator's reconciliation run, in its own transaction: a mistake on one
+     * order must not roll back the others, and the release-intent row it writes must not depend on
+     * the rest of the list either. The per-order advisory lock ({@link SagaOrderLocks}) is taken
+     * inside, so this cannot interleave with a running reserve/release/commit for the same order.
+     *
+     * <p>Conservative by design: only {@code RESERVED} rows are handed back. Rows that were already
+     * released change nothing, an order without rows only gets its intent recorded, and an order
+     * with {@code COMMITTED} rows is refused outright — committed stock is a sale, and a typo'd
+     * id in the operator's list must not turn money into merchandise (the refund flow does that,
+     * with its own {@code ReleaseStock} command and its own bookkeeping). The intent is recorded
+     * for everything this run accepted, so a duplicate {@code OrderCreated} for a recovered order
+     * can never hold stock again either.
+     *
+     * <p><b>Package-private on purpose, and no authority on its own:</b> this method trusts that the
+     * order is already known to be {@code CANCELLED} or {@code REJECTED}. The only caller,
+     * {@link ReservationReconciliation}, establishes that from order-service's own answer before
+     * calling; nothing outside this package can reach it.
+     *
+     * @param orderId order whose leaked holds are being recovered
+     * @param reason  operator-supplied why, stored with the intent
+     * @return what this order's rows were in and what was done about them
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    ReconciliationOutcome reconcileRelease(UUID orderId, String reason) {
+        // Same per-order serialization the saga steps use, so a recovery can run while live
+        // traffic reserves, releases or commits this very order and both see consistent rows.
+        sagaOrderLocks.lockOrder(orderId);
+        List<StockReservation> all = reservations.findByOrderIdOrderByCreatedAtAsc(orderId);
+        if (all.isEmpty()) {
+            // Nothing here — but the operator asserts this order is finished, so the intent still
+            // has to exist: stock this order would hold must never be held in the future either.
+            releaseIntents.insertIfAbsent(orderId, reason);
+            log.info("Reconciliation for order {}: no reservations, intent recorded", orderId);
+            return ReconciliationOutcome.NO_RESERVATIONS;
+        }
+        if (all.stream().anyMatch(reservation -> reservation.getStatus() == ReservationStatus.COMMITTED)) {
+            log.warn("Reconciliation for order {}: contains COMMITTED (sold) rows, skipping entirely",
+                    orderId);
+            return ReconciliationOutcome.SKIPPED_COMMITTED;
+        }
+        // Intent first, rows second: both commit together, and the ON CONFLICT upsert keeps the
+        // first reason for repeated recovery runs.
+        releaseIntents.insertIfAbsent(orderId, reason);
+        List<StockReservation> held = all.stream()
+                .filter(reservation -> reservation.getStatus() == ReservationStatus.RESERVED)
+                .toList();
+        if (held.isEmpty()) {
+            log.info("Reconciliation for order {}: everything already released", orderId);
+            return ReconciliationOutcome.ALREADY_RELEASED;
+        }
+        Map<UUID, Product> locked = products.lockAllByIdIn(
+                        held.stream().map(StockReservation::getProductId).distinct().toList()).stream()
+                .collect(Collectors.toMap(Product::getId, Function.identity()));
+        for (StockReservation reservation : held) {
+            Product product = locked.get(reservation.getProductId());
+            if (product == null) {
+                throw new IllegalStateException(
+                        "Reservation " + reservation.getId() + " points at a missing product");
+            }
+            // Movement before the status flip, so the units are taken from the column they are in.
+            product.releaseReserved(reservation.getQuantity());
+            reservation.release();
+        }
+        reservations.flush();
+        products.flush();
+        log.info("Reconciliation for order {}: released {} leaked reservation row(s)",
+                orderId, held.size());
+        return ReconciliationOutcome.RELEASED;
     }
 
     /**
@@ -177,6 +289,9 @@ public class StockReservationTransactions {
      * idempotent under redelivery.
      */
     private ReservationTransition transition(UUID orderId, ReservationStatus target) {
+        // Lock before the first read: rows loaded ahead of a competing release/commit would be
+        // stale once the product rows are finally locked, and the same units would move twice.
+        sagaOrderLocks.lockOrder(orderId);
         List<StockReservation> all = reservations.findByOrderIdOrderByCreatedAtAsc(orderId);
         if (all.isEmpty()) {
             return ReservationTransition.UNKNOWN_ORDER;
@@ -199,6 +314,9 @@ public class StockReservationTransactions {
                         "Reservation " + reservation.getId() + " points at a missing product");
             }
             if (target == ReservationStatus.RELEASED) {
+                // Movement before the status flip: the units' source column is the reservation's
+                // still-current status. A committed line returns its units (a refund), a reserved
+                // one gives its hold back.
                 if (reservation.getStatus() == ReservationStatus.COMMITTED) {
                     product.returnCommitted(reservation.getQuantity());
                 }
@@ -216,6 +334,25 @@ public class StockReservationTransactions {
         products.flush();
         log.info("Moved {} reservation line(s) of order {} to {}", movable.size(), orderId, target);
         return ReservationTransition.APPLIED;
+    }
+
+    /**
+     * A release is the saga's "this order is over": rows go back to the shelf and, whatever state
+     * they were in (moved now, already released, none at all), the intent is queued in the same
+     * commit. The {@code ON CONFLICT} upsert keeps the first reason, so repeat releases change
+     * nothing.
+     */
+    private ReservationTransition releaseAndRecordIntent(UUID orderId, String reason) {
+        ReservationTransition transition = transition(orderId, ReservationStatus.RELEASED);
+        releaseIntents.insertIfAbsent(orderId, releaseReason(reason));
+        return transition;
+    }
+
+    private static String releaseReason(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return DEFAULT_RELEASE_REASON;
+        }
+        return reason.length() <= MAX_REASON_LENGTH ? reason : reason.substring(0, MAX_REASON_LENGTH);
     }
 
     /**

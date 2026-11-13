@@ -81,6 +81,11 @@ payments:
 # PAYMENT_DECLINE_ABOVE: every amount above this is declined (the "payment declined" demo).
 # PAYMENT_FAILURE_RATE: share of orders (0..1) declined regardless of amount, chosen from a hash of
 # the order id rather than at random.
+#
+# NOTE: this is a simulated provider — charging and refunding only flip rows in this service's
+# payments table. No real money moves, no real acquirer is called, and nothing here is correct for
+# real payments. A real provider would be an integration project of its own (credentials, PCI
+# scope, settlement semantics), not a configuration change.
 
 management:
   tracing:

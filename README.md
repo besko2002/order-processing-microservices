@@ -39,9 +39,9 @@ gateway with JWT and rate limiting, circuit breakers, and end-to-end correlation
 |---|---|---|
 | `api-gateway` | 8080 | Single entry point: routes, JWT check, rate limiting (Redis), correlation id |
 | `auth-service` | 8081 | Register / login, issues RS256 JWTs, publishes the JWKS |
-| `order-service` | 8082 | Orders, idempotent checkout, **Saga orchestrator**, timeout sweeper |
-| `inventory-service` | 8083 | Product catalogue, stock reservations (all-or-nothing, no overselling) |
-| `payment-service` | 8084 | Simulated payment provider: authorize, decline, refund |
+| `order-service` | 8082 | Orders, idempotent checkout, **Saga orchestrator**, timeout sweeper, tracked refunds |
+| `inventory-service` | 8083 | Product catalogue, stock reservations (all-or-nothing, no overselling), durable release intents, operator reconciliation |
+| `payment-service` | 8084 | **Simulated** payment provider: authorize, decline, refund |
 | `notification-service` | 8085 | Emails the customer when an order is confirmed / cancelled / rejected |
 | `common-events` | – | Event & command records, topic names, header names |
 | `service-support` | – | Shared auto-configuration: security, errors, correlation id, outbox, idempotency, DLT, Swagger |
@@ -50,13 +50,34 @@ gateway with JWT and rate limiting, circuit breakers, and end-to-end correlation
 
 ```
 POST /api/orders ─► order PENDING ─► OrderCreated ─► inventory reserves stock
+                                                      │   (refuses if a release for this order
+                                                      │    was already recorded → StockRejected)
                                                       ├─ StockRejected ─► order REJECTED
-                                                      └─ StockReserved ─► ProcessPayment ─► payment
+                                                      └─ StockReserved ─► ProcessPayment ─► payment (simulated)
                                                                            ├─ PaymentCompleted ─► CONFIRMED + CommitStock
                                                                            └─ PaymentFailed ─► ReleaseStock ─► CANCELLED
+POST /api/orders/{id}/cancel (in flight) ─► ReleaseStock + CANCELLED, refund only if payment_id is known
 POST /api/orders/{id}/cancel (CONFIRMED) ─► RefundPayment + ReleaseStock ─► CANCELLATION_PENDING ─► PaymentRefunded ─► CANCELLED
-Orders stuck longer than ORDER_SAGA_TIMEOUT are cancelled with compensation by a sweeper.
+Late PaymentCompleted (the cancel/timeout beat it) ─► RefundPayment queued + orders.refund_status NONE→REQUESTED
+                                                      in one transaction ─► PaymentRefunded ─► REFUNDED
+Late StockReserved for a cancelled order ─► reservation remembered + ReleaseStock re-asserted
+Orders stuck longer than ORDER_SAGA_TIMEOUT are cancelled with compensation by a sweeper. The same
+tick runs a second, refund-only scan: a refund whose command was lost is re-commanded when it has
+gone unanswered for ORDER_SAGA_REFUND_RETRY_INTERVAL, measured from the last attempt
+(orders.refund_retry_at, booked atomically with each command) — an order that is already cancelled
+or cancelling is not re-cancelled, re-announced or re-confirmed by that scan, only the money is
+re-asked for. That scan is the only thing that retries a refund: the timeout scan skips every order
+with an outstanding refund, so the two settings are independent (the retry interval may be longer
+than the order timeout).
 ```
+
+`orders.refund_status` (`NONE → REQUESTED → REFUNDED`, migration `V5__refund_tracking.sql`) tracks a
+refund independently of the order status: a cancelled order is final, but a charge that completed
+while it was cancelling still owes the customer their money. Every `RefundPayment` command and its
+flag flip commit together, so "refund requested" is never a lie, duplicates queue no second command,
+and the eventual `PaymentRefunded` closes the flag exactly once. `orders.refund_retry_at`
+(migration `V6__refund_recovery.sql`) books each attempt so the recovery sweep re-commands
+unanswered refunds on a deliberate interval instead of every tick.
 
 | Topic | Messages | Producer → Consumer |
 |---|---|---|
@@ -79,10 +100,20 @@ Orders stuck longer than ORDER_SAGA_TIMEOUT are cancelled with compensation by a
   unknown messages go to the DLT immediately. Consumers keep running.
 - **No overselling** — stock rows are locked in id order (deadlock-free) with optimistic-locking
   retry; a 20-thread / 10-unit concurrency test proves exactly 10 reservations succeed.
+- **No late-order reservations** — every `ReleaseStock` leaves a durable row in
+  `order_release_intents` (migration `V5__order_release_intents.sql`), even when nothing was
+  reserved yet, and every `OrderCreated` checks it before reserving. Per-order Postgres advisory
+  locks (`pg_advisory_xact_lock`) serialize `OrderCreated` / `ReleaseStock` / `CommitStock` /
+  reconciliation inside the database, so a release that overtakes its reservation on a different
+  Kafka topic can never be forgotten, and the saga re-releases a reservation that escapes its own
+  cancellation. The lock and the intent are enforced in the shared reserve/release/commit
+  primitives (not only in the Kafka handlers), so a direct `StockReservationService` call gets the
+  same guarantees as a message.
 - **Resilience** — order-service prices items through inventory with a Resilience4j retry +
   circuit breaker; when inventory is down the API answers `503` with `Retry-After`.
 - **Idempotent checkout** — `Idempotency-Key` header: a replay returns the same order, a different
-  body with the same key is `409`.
+  body with the same key is `409`. The gateway's CORS allow-list names the header, so browser
+  pre-flights accept it (see `SecurityConfig` of the gateway).
 - **Defense in depth** — the gateway validates the JWT, and every service validates it again.
   Client-supplied `X-User-Id` / `X-User-Roles` headers are stripped at the edge.
 - **Correlation id** — `X-Correlation-Id` travels from the HTTP request through every Kafka hop
@@ -183,7 +214,9 @@ products under `/api/inventory/**`.
 | `POST /api/auth/register`, `POST /api/auth/login` | public |
 | `GET /api/auth/me` | user |
 | `GET /api/products`, `GET /api/products/{id}` | public |
-| `POST/PUT/PATCH/DELETE /api/inventory/products/**`, `GET /api/inventory/reservations` | admin |
+| `POST/PUT/PATCH/DELETE /api/inventory/products/**` | admin |
+| `POST /api/inventory/reservations/reconcile` | admin (operator runbook below; verifies each order with order-service) |
+| `GET /api/inventory/reservations?orderId=` | admin |
 | `POST /api/orders` (optional `Idempotency-Key`) | user |
 | `GET /api/orders/me`, `GET /api/orders/{id}`, `POST /api/orders/{id}/cancel` | owner or admin |
 | `GET /api/orders` | admin |
@@ -196,14 +229,87 @@ Every setting has a working local default and can be overridden by an environmen
 full list with explanations is in [`.env.example`](.env.example). Notable ones:
 `AUTH_JWT_PRIVATE_KEY` / `AUTH_JWT_PUBLIC_KEY` (otherwise an ephemeral key pair is generated at
 startup), `PAYMENT_DECLINE_ABOVE` (default 1000.00), `ORDER_SAGA_TIMEOUT` (default 2 minutes),
-`RATE_LIMIT_REPLENISH_RATE` / `RATE_LIMIT_BURST_CAPACITY`, `INVENTORY_SEED_DEMO`.
+`ORDER_SAGA_REFUND_RETRY_INTERVAL` (default 30 seconds),
+`RATE_LIMIT_REPLENISH_RATE` / `RATE_LIMIT_BURST_CAPACITY`, `INVENTORY_SEED_DEMO`,
+`NOTIFICATION_RECIPIENT_DOMAIN` (demo e-mail domain, see below).
+
+**Schema changes:** both new migrations (`order_db` → `V5__refund_tracking.sql` and
+`V6__refund_recovery.sql`,
+`inventory_db` → `V5__order_release_intents.sql`) are plain additive changes and are applied by
+Flyway at startup, in place: columns with safe defaults (`'NONE'`; `refund_retry_at` is backfilled
+from `updated_at` for refunds already requested), one check constraint, three indexes and one new
+table. No data migration is needed — rows already in the database get a refund
+status that matches the old behaviour (no outstanding refund), and orders that were cancelled
+before the fix can be recovered with the runbook below.
+
+### Recovering reservations leaked before the release-intent fix (operator runbook)
+
+Deployments older than `V5__order_release_intents.sql` can have cancelled orders that still hold
+stock (a release that raced a reserve lost the race, invisibly). To recover them:
+
+```sql
+-- 1) optional: list candidates in the order-service database. This is only a way to find ids; it
+--    is NOT what authorizes the release (see below).
+SELECT id, status, updated_at FROM orders WHERE status IN ('CANCELLED', 'REJECTED') ORDER BY updated_at DESC;
+-- orders with rows in inventory_db.stock_reservations that are still RESERVED are the leak
+```
+
+```bash
+# 2) hand the ids to inventory-service — explicit ids only, at most 200 per call, no null ids;
+#    one entry per distinct order in the response tells you what happened to it
+curl -X POST http://localhost:8080/api/inventory/reservations/reconcile \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"orderIds":["<id1>","<id2>"],"reason":"incident 1234 cleanup"}'
+# acted on (the order is CANCELLED/REJECTED):  RELEASED | ALREADY_RELEASED | NO_RESERVATIONS | SKIPPED_COMMITTED
+# refused, nothing touched: REFUSED_ACTIVE_ORDER | REFUSED_ORDER_NOT_FOUND | REFUSED_ACCESS_DENIED |
+#                           REFUSED_UNVERIFIABLE | REFUSED_VERIFICATION_UNAVAILABLE |
+#                           SKIPPED_VERIFICATION_UNAVAILABLE
+```
+
+**The server verifies, the operator does not.** For every id, inventory-service asks order-service
+(`GET /api/orders/{id}`, at `ORDER_BASE_URL`, `http://localhost:8082` by default and
+`http://order-service:8082` under docker compose) with *your own* administrator token, forwarded
+as-is and never logged — there is no service credential and no extra privileged endpoint. It acts
+only when the answer is a well-formed `200` for that exact order whose status is `CANCELLED` or
+`REJECTED` (both immutable). An order in any other state (`PENDING`, `STOCK_RESERVED`,
+`PAYMENT_PENDING`, `CONFIRMED`, `CANCELLATION_PENDING`) is refused, and so is anything doubtful:
+`404`, `401`/`403`, a timeout, a `5xx`, an unreachable order-service, a malformed or oversized body,
+another order's id, an unknown or missing status, a redirect. A refused id has **no effect at all**:
+no stock counter, reservation row, release intent or outbox row changes — so a typo'd id of an
+active order cannot release its stock or poison it with a tombstone. Each call has a 1 s connect and
+2 s read timeout (`ORDER_CONNECT_TIMEOUT_MS`, `ORDER_READ_TIMEOUT_MS`), and after 3 consecutive
+failures the remaining ids of the batch are reported as `SKIPPED_VERIFICATION_UNAVAILABLE` instead of
+being sent into the same failure; fix the dependency and run the list again (the call is idempotent).
+
+For a verified order the tool releases only `RESERVED` rows, records a release intent (so a later
+duplicate `OrderCreated` cannot reserve again), and still refuses any order that has `COMMITTED`
+rows — those are sales, and undoing them is the refund flow's job (a `ReleaseStock` command after a
+`PaymentRefunded`), not an operator checkbox. The order-service call is made outside every inventory
+transaction; the per-order transaction that follows is serialized with live traffic by the advisory
+lock.
 
 ## Tests
 
-Over 280 tests, most of them integration tests against **real PostgreSQL and Kafka** started by
-Testcontainers (Docker must be running): the Saga transitions and compensations, outbox
-atomicity and relay retries, idempotent consumers, the DLT, stock concurrency, the gateway's
-security and rate limiting, and the circuit breaker.
+Integration tests against **real PostgreSQL and Kafka** started by Testcontainers (Docker must be
+running): the Saga transitions and compensations, outbox atomicity and relay retries, idempotent
+consumers, the DLT, stock concurrency, the gateway's security and rate limiting and CORS, and the
+circuit breaker. Two suites exist for the regression corners fixed here:
+
+- `OrderSagaLatePaymentTest` — a `PaymentCompleted` that arrives after the customer cancelled or
+  the sweep gave up is refunded exactly once and tracked to completion, including duplicate
+  deliveries, a lost refund command that the sweep re-commands, and a concurrent
+  cancel-vs-charge race.
+- `InventorySagaReleaseIntentTest` / `OrderSagaLateInventoryTest` /
+  `InventoryReservationReconciliationTest` — release-before-reserve, duplicate releases,
+  duplicate `OrderCreated`s rejected via the persisted intent, concurrent reserve/release
+  serialization, the saga's defensive late `StockReserved`, and the operator reconciliation
+  (which refuses to touch committed sales).
+- `StockReservationPrimitiveGuardsTest` — the same guarantees through the public service
+  (release intents, per-order serialization with forced commit/release and reserve/release races
+  against a real PostgreSQL). `ReservationReconciliationVerificationTest` / `OrderStatusClientTest` —
+  reconciliation only acts on orders order-service reports as cancelled or rejected: active,
+  unknown, denied, timed-out, malformed and foreign answers are refused with zero effects, against
+  a mock order-service.
 
 ```bash
 ./mvnw verify
@@ -211,8 +317,22 @@ security and rate limiting, and the circuit breaker.
 
 ## Known limitations
 
-- Payments are simulated (deterministic: decline above a threshold, optional failure rate).
-- Order events carry the customer id but not the email address, so notification emails go to a
-  demo address `<customerId>@customers.orders.local` (visible in MailHog).
+- **Payments are simulated, and nothing pretends otherwise.** No real provider is contacted:
+  `payment-service` runs a deterministic simulated gateway (declines above
+  `PAYMENT_DECLINE_ABOVE`, optional failure rate). Every provider reference it hands out starts
+  with `SIM-` ("simulated provider") and its ledger — rows flipping `AUTHORIZED` → `REFUNDED` in
+  payment-service's own database — is the whole "bank". A real integration would need provider-side
+  webhooks, a secure key store and PCI scope, and is out of scope here.
+- **E-mail delivery is demo-only.** Event payloads carry the customer id but never a trustworthy
+  address (an arbitrary "To" address taken from a payload would be a spoofable identity), so every
+  mail goes to the synthetic recipient `<customerId>@NOTIFICATION_RECIPIENT_DOMAIN`
+  (`customers.orders.local` by default) and lands in MailHog. It can be inspected there, but it is
+  not delivered to a real person — wiring real customer addresses is a deliberate future change
+  that needs a verified address source and the privacy controls that go with it.
+- **E-mail delivery is at-least-once.** The idempotency note and the mail send commit together:
+  an SMTP failure rolls the step back and the retry/DLT policy handles it, but if the process dies
+  *after* the send and *before* the commit, the redelivery sends the same mail again. Duplicate
+  e-mails are possible by design here; exactly-once SMTP would need an outbox for mails or
+  provider-side de-duplication.
 - Without configured RSA keys, auth-service generates a new key pair on every start, so tokens
   issued before a restart stop working.

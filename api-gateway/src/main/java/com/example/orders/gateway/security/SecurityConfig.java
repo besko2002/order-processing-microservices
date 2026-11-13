@@ -40,6 +40,13 @@ class SecurityConfig {
     /** Claim auth-service puts the role names in, always an array (e.g. {@code ["USER"]}). */
     static final String ROLES_CLAIM = "roles";
 
+    /**
+     * The optional replay guard of {@code POST /api/orders}. Defined by order-service's API, but the
+     * gateway's CORS configuration must allow it or browser clients cannot send it (a pre-flight
+     * that does not list a header makes the actual request fail before it is ever routed).
+     */
+    static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
     @Bean
     SecurityWebFilterChain securityWebFilterChain(
             ServerHttpSecurity http,
@@ -102,6 +109,10 @@ class SecurityConfig {
     /**
      * @param properties allowed browser origins
      * @return CORS rules for {@code /**}; credentials are allowed, so the origin list stays exact
+     *         (no wildcard origins alongside credentials), and the header list covers what the
+     *         browser-driven clients actually need: the bearer token, the body content type and the
+     *         {@code Idempotency-Key} of {@code POST /api/orders} — without it a pre-flight for the
+     *         idempotent checkout would be refused and the browser client could not retry safely.
      */
     @Bean
     CorsConfigurationSource corsConfigurationSource(GatewayEdgeProperties properties) {
@@ -113,7 +124,10 @@ class SecurityConfig {
                 HttpMethod.PUT.name(),
                 HttpMethod.PATCH.name(),
                 HttpMethod.DELETE.name()));
-        configuration.setAllowedHeaders(List.of(HttpHeaders.AUTHORIZATION, HttpHeaders.CONTENT_TYPE));
+        configuration.setAllowedHeaders(List.of(
+                HttpHeaders.AUTHORIZATION,
+                HttpHeaders.CONTENT_TYPE,
+                IDEMPOTENCY_KEY_HEADER));
         configuration.setExposedHeaders(List.of(GatewayHeaders.CORRELATION_ID));
         configuration.setAllowCredentials(true);
         configuration.setMaxAge(3600L);

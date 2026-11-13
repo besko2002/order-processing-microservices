@@ -3,6 +3,7 @@ package com.example.orders.inventory.api;
 import com.example.orders.inventory.domain.Product;
 import com.example.orders.inventory.domain.StockReservation;
 import com.example.orders.inventory.service.ProductService;
+import com.example.orders.inventory.service.ReservationReconciliation;
 import com.example.orders.inventory.service.StockReservationService;
 import com.example.orders.support.security.CurrentUser;
 import jakarta.validation.Valid;
@@ -13,6 +14,8 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -37,10 +40,15 @@ class InventoryAdminController {
 
     private final ProductService products;
     private final StockReservationService reservations;
+    private final ReservationReconciliation reconciliation;
 
-    InventoryAdminController(ProductService products, StockReservationService reservations) {
+    InventoryAdminController(
+            ProductService products,
+            StockReservationService reservations,
+            ReservationReconciliation reconciliation) {
         this.products = products;
         this.reservations = reservations;
+        this.reconciliation = reconciliation;
     }
 
     /**
@@ -109,5 +117,32 @@ class InventoryAdminController {
         return found.stream()
                 .map(reservation -> ReservationResponse.of(reservation, skus.get(reservation.getProductId())))
                 .toList();
+    }
+
+    /**
+     * Recovery for reservations that leaked before the release-intent fix: cancelled orders whose
+     * stock was reserved anyway and never given back. ADMIN only. The ids are candidates, not
+     * proof: for each one the server asks order-service (with this administrator's own token,
+     * forwarded and never logged) and releases only orders that service reports as
+     * {@code CANCELLED} or {@code REJECTED}. Active, unknown, unverifiable or unverified orders are
+     * refused with a per-order outcome and no effect. Every verified order is processed in its own
+     * transaction serialized with running saga steps; only holding stock is touched, committed
+     * (sold) rows are refused so a wrong id cannot turn a real sale into merchandise.
+     *
+     * @param request the orders to recover, plus an optional audit reason
+     * @param jwt     the validated token of the calling administrator
+     * @return one entry per distinct order id with what happened to it
+     */
+    @PostMapping("/reservations/reconcile")
+    ReconciliationResponse reconcileReservations(
+            @Valid @RequestBody ReconciliationRequest request, @AuthenticationPrincipal Jwt jwt) {
+        log.info("Admin {} runs a reservation reconciliation for {} order(s): {}",
+                CurrentUser.id().orElse(null), request.distinctOrderIds().size(), request.reason());
+        return new ReconciliationResponse(
+                reconciliation.recover(
+                                request.distinctOrderIds(), request.reason(), jwt == null ? null : jwt.getTokenValue())
+                        .stream()
+                        .map(line -> new ReconciliationResponse.Entry(line.orderId(), line.outcome()))
+                        .toList());
     }
 }

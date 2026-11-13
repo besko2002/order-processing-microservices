@@ -75,6 +75,24 @@ public class Order {
     @Column(name = "payment_id")
     private UUID paymentId;
 
+    /**
+     * The saga's own view of the refund for {@link #paymentId}. Kept separately from the status
+     * because a cancelled order is final and can still owe the customer their money — see
+     * {@link RefundStatus} for why.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "refund_status", nullable = false, length = 20)
+    private RefundStatus refundStatus = RefundStatus.NONE;
+
+    /**
+     * When the refund of {@link #paymentId} was last commanded (the first request or a recovery
+     * re-queue, whichever is more recent). The recovery sweep reads it as the base for its retry
+     * interval, so a lost refund is re-commanded on a deliberate cadence instead of on every
+     * scheduler tick; see {@code V6__refund_recovery.sql}.
+     */
+    @Column(name = "refund_retry_at")
+    private OffsetDateTime refundRetryAt;
+
     /** Optimistic-locking guard: two saga events for one order cannot both win. */
     @Version
     @Column(name = "version", nullable = false)
@@ -205,6 +223,52 @@ public class Order {
         this.reservationId = reservationId;
     }
 
+    /**
+     * Records the id of a payment whose answer arrived, without touching the status. Used when the
+     * answer is <em>late</em> (the saga already cancelled the order): the payment still happened, so
+     * the refund of exactly this payment has to be trackable — but {@code markConfirmed} would be
+     * wrong, as it would re-confirm a cancelled order.
+     *
+     * @param paymentId payment payment-service recorded
+     */
+    public void rememberPayment(UUID paymentId) {
+        this.paymentId = paymentId;
+    }
+
+    /**
+     * Marks a {@code RefundPayment} command as queued; callers queue the command in the same
+     * transaction, so the flag can never claim a refund that is not actually on its way.
+     *
+     * @return whether this call was the one that requested the refund ({@code false} means a
+     *         refund of the tracked payment is already requested or settled, and queueing another
+     *         command would duplicate the effect)
+     */
+    public boolean requestRefund() {
+        if (this.refundStatus != RefundStatus.NONE) {
+            return false;
+        }
+        this.refundStatus = RefundStatus.REQUESTED;
+        this.refundRetryAt = OffsetDateTime.now(ZoneOffset.UTC);
+        return true;
+    }
+
+    /** Applies a {@code PaymentRefunded} event: the tracked refund is finished. */
+    public void markRefunded() {
+        this.refundStatus = RefundStatus.REFUNDED;
+    }
+
+    /**
+     * Records that the refund was (re-)commanded just now. {@code requestRefund()} stamps the
+     * first attempt; every recovery re-queue calls this so the next attempt waits one retry
+     * interval. The caller writes the outbox row in the same transaction, so the timestamp never
+     * claims an attempt that was not queued.
+     *
+     * @param now the moment of this attempt
+     */
+    public void bookRefundRetry(OffsetDateTime now) {
+        this.refundRetryAt = now;
+    }
+
     private static String trim(String reason) {
         if (reason == null) {
             return null;
@@ -263,6 +327,14 @@ public class Order {
 
     public UUID getPaymentId() {
         return paymentId;
+    }
+
+    public RefundStatus getRefundStatus() {
+        return refundStatus;
+    }
+
+    public OffsetDateTime getRefundRetryAt() {
+        return refundRetryAt;
     }
 
     public long getVersion() {

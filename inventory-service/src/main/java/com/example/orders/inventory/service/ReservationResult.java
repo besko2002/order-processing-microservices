@@ -23,7 +23,14 @@ public record ReservationResult(UUID orderId, Outcome outcome, List<Shortage> sh
         ALREADY_RESERVED,
 
         /** Nothing was reserved: at least one line could not be satisfied. */
-        REJECTED
+        REJECTED,
+
+        /**
+         * Nothing was reserved, and nothing ever will be: the order has a durable release intent
+         * (it was cancelled, released or reconciled here). Never a hold, even when stale
+         * reservation rows of the order still exist.
+         */
+        ALREADY_RELEASED
     }
 
     /** Why one line could not be reserved. */
@@ -60,6 +67,14 @@ public record ReservationResult(UUID orderId, Outcome outcome, List<Shortage> sh
      */
     public static ReservationResult alreadyReserved(UUID orderId) {
         return new ReservationResult(orderId, Outcome.ALREADY_RESERVED, List.of());
+    }
+
+    /**
+     * @param orderId order whose release intent forbids any further reservation
+     * @return a refusal that is not a shortage: no stock moved and none will for this order
+     */
+    public static ReservationResult alreadyReleased(UUID orderId) {
+        return new ReservationResult(orderId, Outcome.ALREADY_RELEASED, List.of());
     }
 
     /**

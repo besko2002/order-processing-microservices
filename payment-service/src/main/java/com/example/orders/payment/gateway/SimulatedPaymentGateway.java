@@ -10,7 +10,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
- * Stands in for a real payment provider.
+ * Stands in for a real payment provider — <strong>simulated money only</strong>.
+ *
+ * <p>Nothing here moves real funds, talks to a real acquirer, or is correct for real money: the
+ * charge writes an {@code AUTHORIZED} row in this service's own database and the refund flips it,
+ * and that ledger is the whole "bank". Documentation, configuration examples and the README label
+ * every charging/refunding behaviour as simulated — an integration with a real payment provider
+ * does not exist and is deliberately out of scope (a real one would need PCI-relevant credentials,
+ * liability and settlement semantics this project does not model).
  *
  * <p>It is deliberately <strong>deterministic</strong>: the same order always gets the same answer.
  * A saga is only testable if its failure branch can be triggered on purpose, and a gateway that

@@ -34,6 +34,25 @@ import org.springframework.transaction.annotation.Transactional;
  * command would only add a hop that could fail. The compensating and completing steps
  * ({@code ReleaseStock}, {@code CommitStock}) <em>are</em> commands, because they are decisions only
  * the orchestrator can make.
+ *
+ * <p><b>Reserve/release ordering.</b> The two messages travel on different topics, so Kafka does not
+ * order them against each other, and a {@code ReleaseStock} can arrive before (or without) the
+ * {@code OrderCreated} it undoes — that is a normal saga overtake, not an error. Two pieces make it
+ * safe:
+ * <ul>
+ *   <li>Every {@code ReleaseStock} writes a row into {@code order_release_intents}, whatever the
+ *       reservation state was. An {@code OrderCreated} checks the intent before reserving, so a
+ *       cancelled order's stock is rejected, never held.</li>
+ *   <li>{@link com.example.orders.inventory.service.SagaOrderLocks#lockOrder} serializes the steps per order inside the database, so the
+ *       intent insert and the reserve cannot interleave invisibly and leave a hold stranded.</li>
+ * </ul>
+ * Both pieces live in the shared {@link StockReservationTransactions} primitives these handlers
+ * call (lock first, intent check on reserve, intent write on release), so the public
+ * {@code StockReservationService} and the operator reconciliation get exactly the same guarantees
+ * as a Kafka message does; the handlers add only the event de-duplication and the outbox answers,
+ * in the same transaction.
+ * The order saga re-asserts releases for late reservations in addition; together the two sides turn
+ * "release before reserve" into "eventually released" on every order-of-arrival.
  */
 @Component
 public class InventorySagaTransactions {
@@ -81,7 +100,21 @@ public class InventorySagaTransactions {
             return;
         }
 
+        // The primitive serializes against ReleaseStock/CommitStock for this order (see
+        // SagaOrderLocks) and checks the release intent before it reserves anything.
         ReservationResult result = reservations.reserveWithin(event.orderId(), event.items());
+        if (result.outcome() == ReservationResult.Outcome.ALREADY_RELEASED) {
+            // This order was cancelled (or its saga gave up) before — possibly before the
+            // OrderCreated even arrived, which is why a mere "no reservation rows" check can never
+            // be enough. Refuse to hold stock: the compensation on the order side has already been
+            // promised, and a reservation granted now would retry that promise with an event that
+            // was never sent. Rejections are idempotent: duplicate or replayed OrderCreated events
+            // keep landing here for as long as the services run.
+            log.warn("OrderCreated for order {} whose release was already processed: rejecting stock",
+                    event.orderId());
+            reject(event.orderId(), "The order was cancelled before its stock could be reserved", List.of());
+            return;
+        }
         if (result.isHoldingStock()) {
             UUID reservationId = representativeReservationId(event.orderId());
             outbox.record(event.orderId(), StockReserved.class.getSimpleName(), Topics.INVENTORY_EVENTS,
@@ -112,12 +145,21 @@ public class InventorySagaTransactions {
             log.warn("Ignoring CommitStock without an order id");
             return;
         }
+        // The primitive takes the per-order lock: a CommitStock racing a ReleaseStock (a
+        // cancellation just before the confirmation completes) sees either the committed row or
+        // the released row, never an inconsistent in-between, and a released row is never revived.
         ReservationTransition transition = reservations.commitWithin(command.orderId());
         log.info("CommitStock for order {}: {}", command.orderId(), transition);
     }
 
     /**
      * Compensating command: give the order's stock back.
+     *
+     * <p>The release is always paired with a durable intent row
+     * ({@code order_release_intents}): whatever state the reservations were in — released here,
+     * or never reserved at all — a later {@code OrderCreated} for this order id must not hold
+     * stock again. That pairing is what makes "release before reserve" terminal instead of a
+     * lost message.
      *
      * @param eventId id of the {@code ReleaseStock} command
      * @param command its payload
@@ -131,9 +173,19 @@ public class InventorySagaTransactions {
             log.warn("Ignoring ReleaseStock without an order id");
             return;
         }
-        ReservationTransition transition = reservations.releaseWithin(command.orderId());
-        // UNKNOWN_ORDER is normal and not a failure: the orchestrator releases unconditionally when
-        // it cancels, because it cannot know whether a reservation was ever taken.
+        // Under the per-order lock the primitive releases the rows and records the intent in this
+        // transaction, for every outcome — including UNKNOWN_ORDER (nothing was ever reserved here,
+        // yet) and ALREADY_APPLIED (duplicate release). The ON CONFLICT upsert keeps the first
+        // reason; repeat releases change nothing.
+        ReservationTransition transition = reservations.releaseWithin(command.orderId(), command.reason());
+        if (transition == ReservationTransition.UNKNOWN_ORDER) {
+            // Normal and not a failure: the orchestrator releases unconditionally when it cancels,
+            // because it cannot know whether a reservation was ever taken. The intent row above is
+            // what stops a not-yet-consumed OrderCreated from reserving afterwards.
+            log.info("ReleaseStock for order {} ({}): {} — release intent recorded",
+                    command.orderId(), command.reason(), transition);
+            return;
+        }
         log.info("ReleaseStock for order {} ({}): {}",
                 command.orderId(), command.reason(), transition);
     }

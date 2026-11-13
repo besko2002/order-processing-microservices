@@ -15,12 +15,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Turns final order events into customer emails.
+ * Turns final order events into customer emails — <b>demo delivery</b>: the recipient is the
+ * synthetic {@code <customerId>@<recipientDomain>} produced from the event's customer id (see
+ * {@link NotificationProperties} for why no event payload is ever trusted with a recipient), and
+ * the mail lands in MailHog, not in a real person's inbox. This is not a production email
+ * integration and is not presented as one.
  *
- * <p>Idempotent: the event id is recorded in {@code processed_events} in the same transaction as the
- * notification row, so a Kafka redelivery sends nothing twice. The mail is sent inside that
- * transaction; if SMTP fails the exception rolls everything back and the consumer's retry/DLT policy
- * takes over.
+ * <p>Idempotency, honestly bounded: the event id is recorded in {@code processed_events} in the same
+ * transaction as the notification row, and the mail is sent inside that transaction, so an SMTP
+ * failure rolls the whole step back and the consumer's retry/DLT policy retries it. The reverse
+ * failure — <strong>the send succeeds and the process dies before the commit</strong> — means the
+ * redelivery records the event anew and sends again: a database transaction does not make SMTP
+ * exactly-once. Delivery is at-least-once; duplicate suppression shrinks double mails and cannot
+ * eliminate them, and nothing anywhere claims otherwise.
  */
 @Service
 public class NotificationService {

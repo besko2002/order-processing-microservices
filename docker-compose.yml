@@ -135,6 +135,9 @@ services:
       <<: *app-env
       SERVER_PORT: 8083
       INVENTORY_SEED_DEMO: ${INVENTORY_SEED_DEMO:-true}
+      # Operator reconciliation verifies an order's state with order-service (GET /api/orders/{id},
+      # forwarding the administrator's own token) before it releases anything.
+      ORDER_BASE_URL: http://order-service:8082
     ports: ["8083:8083"]
     depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 

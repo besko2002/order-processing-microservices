@@ -7,6 +7,7 @@ import com.example.orders.common.events.StockRejected;
 import com.example.orders.common.events.StockReserved;
 import com.example.orders.order.api.OrderResponse;
 import com.example.orders.support.tx.OptimisticRetry;
+import java.time.OffsetDateTime;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -113,5 +114,16 @@ public class OrderSaga {
      */
     public boolean timeOut(UUID orderId, String reason) {
         return OptimisticRetry.execute(maxAttempts, () -> transactions.timeOut(orderId, reason));
+    }
+
+    /**
+     * @param orderId   order still owed the refund of its tracked payment
+     * @param reason    what the re-commanded payload shows
+     * @param dueBefore refunds last commanded at or before this instant are due
+     * @return whether this call re-queued the refund
+     */
+    public boolean recoverOutstandingRefund(UUID orderId, String reason, OffsetDateTime dueBefore) {
+        return OptimisticRetry.execute(maxAttempts,
+                () -> transactions.recoverOutstandingRefund(orderId, reason, dueBefore));
     }
 }

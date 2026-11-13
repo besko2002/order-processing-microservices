@@ -53,10 +53,13 @@ import org.testcontainers.utility.DockerImageName;
  * <p>Containers and stub are started once per JVM from a static initialiser rather than per class,
  * and every subclass that does not override a property shares one Spring context: Docker Desktop
  * on this machine has ~4 GB.
+ *
+ * <p>{@code public} only so that a test living next to the package-private saga classes
+ * ({@code com.example.orders.order.saga}) can share this environment.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
-abstract class OrderIntegrationTest {
+public abstract class OrderIntegrationTest {
 
     /** Issuer the service is configured to trust in these tests. */
     protected static final String ISSUER = "order-processing-auth";
@@ -150,12 +153,32 @@ abstract class OrderIntegrationTest {
     @Autowired
     protected OutboxRepository outbox;
 
-    /** Every test starts from an empty database and an empty catalog. */
+    /**
+     * Every test starts from an empty database and an empty catalog.
+     *
+     * <p>Cleanup is a bulk {@code DELETE} per table, never "load the entities, then delete them
+     * one by one": a context with live scheduled work (the sweeper, the outbox relay, the saga
+     * listeners — {@code OrderRefundRecoveryTest} runs a 300 ms sweep on purpose) may commit a new
+     * {@code @Version} of an order between the load and the delete, and the versioned per-entity
+     * delete then fails with {@code ObjectOptimisticLockingFailureException} before the test body
+     * even starts. A statement-level delete has no version to lose: it waits for a concurrent
+     * writer's row lock, removes the committed row, and the writer — if it comes second — finds
+     * its row gone, rolls back (outbox row included) and, in the sweeper's case, stands down on
+     * the retry.
+     *
+     * <p>Orders go first, then the outbox: once no order is left, nothing in flight can queue a
+     * command for one any more (a transaction that already queued one commits before the order
+     * delete finishes, so the outbox delete that follows sees and removes its row too). Ordering
+     * across the two tables is all the atomicity needed — there is no foreign key between them.
+     * {@code order_items} is {@code ON DELETE CASCADE} ({@code V2__create_orders.sql}, its only
+     * foreign key into {@code orders}), so the lines go with their orders inside the same
+     * statement; a TRUNCATE would take an exclusive lock and stall behind every open transaction
+     * instead, which is why it is not used.
+     */
     @BeforeEach
     void resetState() {
+        orders.deleteAllInBatch();
         outbox.deleteAllInBatch();
-        // order_items is ON DELETE CASCADE, so removing the orders removes the lines.
-        orders.deleteAll();
         CATALOG.clear();
         CATALOG_CORRELATION_IDS.clear();
         catalogBehaviour = OrderIntegrationTest::serveFromCatalog;

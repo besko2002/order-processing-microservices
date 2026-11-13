@@ -70,6 +70,34 @@ class StockReservationRetryTest {
     }
 
     @Test
+    void aUniqueViolationWrappedInACauseIsStillReadAsAnAlreadyReservedOrder() {
+        when(transactions.reserve(eq(orderId), any()))
+                .thenThrow(new DataIntegrityViolationException("could not execute statement",
+                        new RuntimeException("ERROR: duplicate key value violates unique constraint "
+                                + "\"uq_stock_reservations_order_product\"")));
+
+        assertThat(service.reserve(orderId, items).outcome()).isEqualTo(ReservationResult.Outcome.ALREADY_RESERVED);
+    }
+
+    @Test
+    void anyOtherConstraintViolationIsNotMistakenForAnAlreadyReservedOrder() {
+        // A foreign key, a CHECK or a different unique index says nothing about whether the order
+        // holds its stock; calling it "already reserved" would announce a reservation nobody made.
+        for (String violation : List.of(
+                "insert or update on table \"stock_reservations\" violates foreign key constraint "
+                        + "\"stock_reservations_product_id_fkey\"",
+                "new row for relation \"products\" violates check constraint "
+                        + "\"products_available_quantity_check\"",
+                "duplicate key value violates unique constraint \"products_sku_key\"")) {
+            when(transactions.reserve(eq(orderId), any())).thenThrow(new DataIntegrityViolationException(violation));
+
+            assertThatThrownBy(() -> service.reserve(orderId, items))
+                    .as(violation)
+                    .isInstanceOf(DataIntegrityViolationException.class);
+        }
+    }
+
+    @Test
     void releaseAndCommitAreRetriedTheSameWay() {
         when(transactions.release(orderId))
                 .thenThrow(new ObjectOptimisticLockingFailureException("Product", UUID.randomUUID()))

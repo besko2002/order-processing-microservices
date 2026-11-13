@@ -35,6 +35,9 @@ public class StockReservationService {
 
     private static final Logger log = LoggerFactory.getLogger(StockReservationService.class);
 
+    /** The one constraint whose violation means "this order was already reserved". */
+    private static final String ORDER_PRODUCT_UNIQUE = "uq_stock_reservations_order_product";
+
     private final StockReservationTransactions transactions;
     private final int maxAttempts;
 
@@ -54,8 +57,9 @@ public class StockReservationService {
      *
      * @param orderId order asking for stock
      * @param items   order lines; two lines for the same product are summed
-     * @return {@code RESERVED}, {@code ALREADY_RESERVED} for a repeat call, or {@code REJECTED}
-     *         with one shortage per unsatisfiable line
+     * @return {@code RESERVED}, {@code ALREADY_RESERVED} for a repeat call, {@code REJECTED} with
+     *         one shortage per unsatisfiable line, or {@code ALREADY_RELEASED} when the order was
+     *         released/cancelled before (a durable release intent exists: nothing is reserved)
      * @throws BadRequestException when the request itself is unusable (no lines, non-positive
      *                            quantity, missing product id)
      */
@@ -66,8 +70,14 @@ public class StockReservationService {
             return OptimisticRetry.execute(maxAttempts, () -> transactions.reserve(orderId, items));
         }
         catch (DataIntegrityViolationException e) {
+            if (!violatesOrderProductUnique(e)) {
+                // A foreign key, a CHECK or anything else is not evidence that the order holds its
+                // stock: reporting it as a duplicate would announce a reservation nobody made.
+                throw e;
+            }
             // Two copies of the same event raced past the pre-check: UNIQUE(order_id, product_id)
-            // stopped the second one, which makes this call a no-op rather than a failure.
+            // stopped the second one, which makes this call a no-op rather than a failure. (Under
+            // the per-order lock this is a last line of defence, not an expected path.)
             log.info("Concurrent duplicate reservation for order {} was rejected by the unique index", orderId);
             return ReservationResult.alreadyReserved(orderId);
         }
@@ -108,6 +118,16 @@ public class StockReservationService {
     public List<StockReservation> reservationsOf(UUID orderId) {
         requireOrderId(orderId);
         return transactions.findByOrder(orderId);
+    }
+
+    private static boolean violatesOrderProductUnique(DataIntegrityViolationException e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message != null && message.contains(ORDER_PRODUCT_UNIQUE)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void requireOrderId(UUID orderId) {
