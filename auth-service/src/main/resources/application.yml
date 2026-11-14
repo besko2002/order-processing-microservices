@@ -7,7 +7,7 @@ spring:
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${AUTH_DB_NAME:auth_db}
     username: ${AUTH_DB_USER:auth_user}
-    password: ${AUTH_DB_PASSWORD:auth_pass}
+    password: ${AUTH_DB_PASSWORD:auth_local_dev_only}
     hikari:
       maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
   jpa:
@@ -36,7 +36,7 @@ auth:
     public-key: ${AUTH_JWT_PUBLIC_KEY:}
   admin:
     email: ${AUTH_ADMIN_EMAIL:admin@orders.local}
-    password: ${AUTH_ADMIN_PASSWORD:Admin@12345}
+    password: ${AUTH_ADMIN_PASSWORD:Admin@LocalDevOnly}
     name: ${AUTH_ADMIN_NAME:Platform Admin}
 
 management:

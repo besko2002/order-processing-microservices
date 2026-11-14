@@ -184,7 +184,7 @@ still in every line). To trace into Jaeger as well, see [Observability](#observa
 **Infrastructure in Docker, services on the host** (handy while developing):
 
 ```bash
-docker compose up -d --wait                       # Postgres, Kafka, Redis, MailHog
+docker compose up -d --build --wait                 # Postgres, Kafka, Redis, MailHog
 ./mvnw -DskipTests install
 java -jar auth-service/target/auth-service-0.0.1-SNAPSHOT.jar &
 INVENTORY_SEED_DEMO=true java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar &
@@ -193,6 +193,10 @@ java -jar payment-service/target/payment-service-0.0.1-SNAPSHOT.jar &
 java -jar notification-service/target/notification-service-0.0.1-SNAPSHOT.jar &
 java -jar api-gateway/target/api-gateway-0.0.1-SNAPSHOT.jar &
 ```
+
+`--build` matters for Postgres: the per-service databases and their owners are created by the
+bootstrap script **baked into that image** (`infra/postgres/init/`), so a changed script needs a
+rebuilt image — and the script itself only ever runs on an empty volume.
 
 Services on the host export spans to `localhost:4318` (Jaeger, `--profile observability`). Without
 Jaeger, start them with `OTLP_TRACING_EXPORT_ENABLED=false` to keep exporter errors out of the logs.
@@ -206,29 +210,138 @@ Jaeger, start them with `OTLP_TRACING_EXPORT_ENABLED=false` to keep exporter err
 
 Host ports avoid common defaults: Postgres **5435**, Kafka **9094**, Redis **6380**.
 
+Every published port is bound to **127.0.0.1** by default (`BIND_ADDRESS` in `.env`), so a
+development stack is not reachable from the network — the containers talk to each other over the
+compose network by service name and never need the host interface. Both workflows above work
+unchanged; only the host's own access is affected, and it still goes through `localhost`. Before
+putting this anywhere on a network, read [Before deploying on a network](#before-deploying-on-a-network).
+
+## What is simulated
+
+Two integrations here are simulations, and the API says so in every response:
+
+- **Payments.** `payment-service` has no acquirer behind it. A "charge" only writes a row in its own
+  `payments` table and a "refund" only flips that row; provider references start with `SIM-` and
+  every payment response carries `"simulated": true`. No money moves, no card details exist, and
+  none of this is correct for real payments.
+- **E-mail.** `notification-service` hands the message to a local SMTP sink (MailHog in
+  development). The recipient is a synthetic address built from the customer id
+  (`<customerId>@customers.orders.local`) — never a real inbox — and every notification response
+  carries `"simulated": true`. `status: SENT` means the sink accepted the message, not that
+  anybody received it.
+
+There are no real customers, no real orders and no real payment account in this project. The demo
+catalog is fictional (`DEMO-*` products) and lives in a local database.
+
 ## Try the flow
+
+The demo catalog is seeded with fictional products (`INVENTORY_SEED_DEMO=true`, the default under
+docker compose). Pick the ids you need from the catalogue:
 
 ```bash
 # register and keep the token
 TOKEN=$(curl -s localhost:8080/api/auth/register -H 'Content-Type: application/json' \
   -d '{"name":"Ada","email":"ada@example.com","password":"Password123"}' | jq -r .accessToken)
 
-# public catalogue (demo products)
-curl -s localhost:8080/api/products | jq '.content[] | {id, sku, price, availableQuantity}'
+# the catalogue (the default seed contains seven fictional products)
+PRODUCTS=$(curl -fsS localhost:8080/api/products)
+printf '%s\n' "$PRODUCTS" | jq '.content[] | {id, sku, price, availableQuantity}'
+HEADSET_ID=$(printf '%s\n' "$PRODUCTS" | jq -er '.content[] | select(.sku == "DEMO-HEADSET-PRO") | .id')
+SPEAKER_ID=$(printf '%s\n' "$PRODUCTS" | jq -er '.content[] | select(.sku == "DEMO-LIMITED-SPEAKER") | .id')
+MONITOR_ID=$(printf '%s\n' "$PRODUCTS" | jq -er '.content[] | select(.sku == "DEMO-PREMIUM-MONITOR") | .id')
+KEYBOARD_ID=$(printf '%s\n' "$PRODUCTS" | jq -er '.content[] | select(.sku == "DEMO-KEYBOARD-87") | .id')
 
-# place an order (under 1000 → CONFIRMED, over 1000 → payment declined → CANCELLED)
-ORDER=$(curl -s localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: checkout-1' \
-  -d '{"items":[{"productId":"<id>","quantity":1}]}' | jq -r .id)
-
-curl -s localhost:8080/api/orders/$ORDER -H "Authorization: Bearer $TOKEN" | jq .status
-curl -s localhost:8080/api/payments/order/$ORDER -H "Authorization: Bearer $TOKEN" | jq .status
-curl -s -X POST localhost:8080/api/orders/$ORDER/cancel -H "Authorization: Bearer $TOKEN"
-curl -s localhost:8080/api/notifications/me -H "Authorization: Bearer $TOKEN" | jq .
+# Saga steps run asynchronously. Wait for an expected final state instead of reading too soon.
+wait_for_order() {
+  order_id=$1 expected=$2
+  for attempt in $(seq 1 30); do
+    status=$(curl -fsS "localhost:8080/api/orders/$order_id" \
+      -H "Authorization: Bearer $TOKEN" | jq -r .status) || return 1
+    if [ "$status" = "$expected" ]; then printf '%s\n' "$status"; return 0; fi
+    sleep 1
+  done
+  printf 'Order %s did not reach %s (last status: %s)\n' "$order_id" "$expected" "$status" >&2
+  return 1
+}
 ```
 
-A seeded admin (`admin@orders.local` / `Admin@12345`, change it with `AUTH_ADMIN_*`) can manage
-products under `/api/inventory/**`.
+**1. A successful order** — `DEMO-HEADSET-PRO` (199.99, under the 1000.00 decline threshold):
+
+```bash
+ORDER_OK=$(curl -s localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: checkout-1' \
+  -d "{\"items\":[{\"productId\":\"$HEADSET_ID\",\"quantity\":1}]}" | jq -r .id)
+
+wait_for_order "$ORDER_OK" CONFIRMED
+# CONFIRMED
+curl -s localhost:8080/api/payments/order/$ORDER_OK -H "Authorization: Bearer $TOKEN" | jq '{status, simulated}'
+# { "status": "AUTHORIZED", "simulated": true }
+```
+
+**2. Not enough stock** — `DEMO-LIMITED-SPEAKER` has 2 units; order 3:
+
+```bash
+ORDER_NOSTOCK=$(curl -s localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: checkout-2' \
+  -d "{\"items\":[{\"productId\":\"$SPEAKER_ID\",\"quantity\":3}]}" | jq -r .id)
+
+wait_for_order "$ORDER_NOSTOCK" REJECTED
+# REJECTED — nothing was reserved
+```
+
+**3. A declined simulated payment** — `DEMO-PREMIUM-MONITOR` (1499.00, above the threshold):
+
+```bash
+ORDER_DECLINED=$(curl -s localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: checkout-3' \
+  -d "{\"items\":[{\"productId\":\"$MONITOR_ID\",\"quantity\":1}]}" | jq -r .id)
+
+wait_for_order "$ORDER_DECLINED" CANCELLED
+# CANCELLED — the simulated provider declined, so the saga released the stock again
+curl -s localhost:8080/api/payments/order/$ORDER_DECLINED -H "Authorization: Bearer $TOKEN" | jq .status
+# FAILED
+```
+
+**4. Cancellation** — request cancellation of a fresh keyboard order. The saga may finish before
+this request arrives; cancelling a confirmed order also requests a simulated refund:
+
+```bash
+ORDER_CANCEL=$(curl -s localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: checkout-4' \
+  -d "{\"items\":[{\"productId\":\"$KEYBOARD_ID\",\"quantity\":1}]}" | jq -r .id)
+
+curl -s -X POST localhost:8080/api/orders/$ORDER_CANCEL/cancel -H "Authorization: Bearer $TOKEN"
+wait_for_order "$ORDER_CANCEL" CANCELLED
+```
+
+**5. Refund compensation** — cancel the **confirmed** order from step 1 (`$ORDER_OK`, not the one
+from step 4): the saga asks the simulated provider to give the money back and releases the reserved
+stock.
+
+```bash
+curl -s -X POST localhost:8080/api/orders/$ORDER_OK/cancel -H "Authorization: Bearer $TOKEN"
+
+wait_for_order "$ORDER_OK" CANCELLED
+# CANCELLED
+curl -s localhost:8080/api/payments/order/$ORDER_OK -H "Authorization: Bearer $TOKEN" | jq '{status, simulated}'
+# { "status": "REFUNDED", "simulated": true }
+```
+
+Each scenario keeps its own order id (`$ORDER_OK`, `$ORDER_NOSTOCK`, `$ORDER_DECLINED`,
+`$ORDER_CANCEL`), so the refund in step 5 provably targets the order that was confirmed in step 1.
+Re-running a step reuses its `Idempotency-Key`, which is the point of that header: the same key
+returns the same order instead of creating a second one.
+
+The mails that went to the local sink (not to anybody):
+
+```bash
+curl -s localhost:8080/api/notifications/me -H "Authorization: Bearer $TOKEN" | jq '.content[] | {type, recipient, status, simulated}'
+```
+
+A seeded admin (`admin@orders.local` / `Admin@LocalDevOnly`, change it with `AUTH_ADMIN_*`) can
+manage products under `/api/inventory/**`. That password is used when the account is *created* —
+an existing database keeps the password it was seeded with, so set `AUTH_ADMIN_PASSWORD` before the
+first start of a fresh environment.
 
 ## API overview (through the gateway)
 
@@ -311,6 +424,28 @@ rows — those are sales, and undoing them is the refund flow's job (a `ReleaseS
 `PaymentRefunded`), not an operator checkbox. The order-service call is made outside every inventory
 transaction; the per-order transaction that follows is serialized with live traffic by the advisory
 lock.
+
+## Before deploying on a network
+
+The defaults shipped here are DEVELOPMENT defaults. They keep a local stack working with no
+configuration, and they are named so that nobody can mistake them for production values
+(`*_local_dev_only`). Before this stack is reachable from anywhere but this machine:
+
+1. **Publish the ports deliberately.** `BIND_ADDRESS` is `127.0.0.1` by default, so nothing is
+   exposed until you set it (`BIND_ADDRESS=0.0.0.0` in `.env`). Keep the databases, Kafka, Redis and
+   MailHog on a private network or behind a firewall even then — see item 5.
+2. **Replace every credential** in `.env`: `POSTGRES_SUPERUSER_PASSWORD`, the five
+   `*_DB_PASSWORD` values, `REDIS_PASSWORD`, `GRAFANA_ADMIN_PASSWORD` and `AUTH_ADMIN_PASSWORD`.
+   The database bootstrap (`infra/postgres/init/01-create-databases.sh`) reads these and creates the
+   database owners with them — but it runs **once, on an empty volume**, so set them before the first
+   start. To change them later, `ALTER ROLE` the existing owners or recreate the volume.
+3. **Set a real JWT key pair**: `AUTH_JWT_PRIVATE_KEY` and `AUTH_JWT_PUBLIC_KEY`. Without them
+   auth-service generates a throw-away 2048-bit pair at every start and every token dies with it.
+4. **Point the clients at the broker**: `KAFKA_EXTERNAL_HOST` is the address clients dial, and
+   `OTLP_TRACING_EXPORT_ENABLED=true` only together with the `observability` profile.
+5. **Know what has no authentication of its own**: Postgres (password per user, `scram-sha-256`),
+   Kafka (no SASL/TLS), Redis (no password unless `REDIS_PASSWORD` is set) and MailHog (no auth at
+   all — it is a development sink). None of them is hardened for an untrusted network.
 
 ## Tests
 

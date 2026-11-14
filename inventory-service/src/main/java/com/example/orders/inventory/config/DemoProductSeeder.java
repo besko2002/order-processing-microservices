@@ -41,6 +41,11 @@ public class DemoProductSeeder implements ApplicationRunner {
     /**
      * Inserts the demo products that are missing.
      *
+     * <p>Everything here is fictional: the SKUs are prefixed {@code DEMO-}, the names are generic and
+     * no real brand, product or price list is copied. The set covers the branches the demo has to
+     * show — a cheap product that completes, a scarce one that runs out of stock, and an expensive
+     * one that the simulated provider declines.
+     *
      * @return how many products this call inserted
      */
     public int seed() {
@@ -54,7 +59,15 @@ public class DemoProductSeeder implements ApplicationRunner {
                 Product.create("DEMO-KEYBOARD-87", "Demo Keyboard 87",
                         "Tenkeyless mechanical keyboard", new BigDecimal("89.90"), 60),
                 Product.create("DEMO-MOUSE-ERGO", "Demo Mouse Ergo",
-                        "Ergonomic wireless mouse", new BigDecimal("49.00"), 75));
+                        "Ergonomic wireless mouse", new BigDecimal("49.00"), 75),
+                // Scarce on purpose: ordering more units than this shows the insufficient-stock
+                // branch (the order is REJECTED and nothing is reserved).
+                Product.create("DEMO-LIMITED-SPEAKER", "Demo Limited Edition Speaker",
+                        "Small-batch speaker, only a few left", new BigDecimal("249.00"), 2),
+                // Above PAYMENT_DECLINE_ABOVE (1000.00 by default): the simulated provider declines
+                // it, so the order is CANCELLED and the stock is released again.
+                Product.create("DEMO-PREMIUM-MONITOR", "Demo Premium Monitor",
+                        "High-resolution studio monitor", new BigDecimal("1499.00"), 10));
 
         int inserted = 0;
         for (Product product : demo) {

@@ -34,11 +34,20 @@ class NotificationController {
                 result.getSize(), result.getTotalElements(), result.getTotalPages(), result.isLast());
     }
 
+    /**
+     * One stored notification.
+     *
+     * <p>{@code simulated} is always {@code true}: the mail is handed to a local SMTP sink
+     * (MailHog in development), never to a real inbox. {@code status} says whether the sink
+     * accepted it — it does not say that anybody received it. Both are in the response on purpose,
+     * so a captured response cannot be read as proof of a delivered email.
+     */
     record NotificationResponse(UUID id, UUID orderId, String type, String channel, String recipient,
-                                String subject, String body, String status, Instant createdAt) {
+                                String subject, String body, String status, boolean simulated,
+                                Instant createdAt) {
         static NotificationResponse from(Notification n) {
             return new NotificationResponse(n.getId(), n.getOrderId(), n.getType().name(), n.getChannel().name(),
-                    n.getRecipient(), n.getSubject(), n.getBody(), n.getStatus().name(), n.getCreatedAt());
+                    n.getRecipient(), n.getSubject(), n.getBody(), n.getStatus().name(), true, n.getCreatedAt());
         }
     }
 

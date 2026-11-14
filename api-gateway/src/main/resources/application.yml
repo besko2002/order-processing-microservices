@@ -8,6 +8,10 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6380}
+      # Empty by default: the local Redis runs without authentication, and it is bound to
+      # 127.0.0.1 only. Set REDIS_PASSWORD before putting it on a network - docker-compose.yml
+      # then starts the server with --requirepass and the gateway authenticates with it.
+      password: ${REDIS_PASSWORD:}
       # Deliberately short: the rate limiter fails open, so a dead Redis must cost every
       # request a few hundred milliseconds at most, not the Lettuce default of 10s.
       timeout: ${REDIS_TIMEOUT:500ms}

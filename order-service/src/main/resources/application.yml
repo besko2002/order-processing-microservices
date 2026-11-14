@@ -7,7 +7,7 @@ spring:
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${ORDER_DB_NAME:order_db}
     username: ${ORDER_DB_USER:order_user}
-    password: ${ORDER_DB_PASSWORD:order_pass}
+    password: ${ORDER_DB_PASSWORD:order_local_dev_only}
     hikari:
       maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
   jpa:

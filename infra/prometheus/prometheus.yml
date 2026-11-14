@@ -1,6 +1,11 @@
 # Scrapes the six services' /actuator/prometheus.
 # "host" = services started with java -jar on the host machine (the usual dev setup);
 # "docker" = services started with `docker compose --profile app`.
+#
+# The compose file binds the published ports to 127.0.0.1, so the "host" job can only reach
+# services that listen on the host itself. When the services run as containers, the "docker"
+# job is the one that scrapes them and the "host" job logs connection refusals - expected,
+# not a problem with the services.
 global:
   scrape_interval: 5s
   evaluation_interval: 5s

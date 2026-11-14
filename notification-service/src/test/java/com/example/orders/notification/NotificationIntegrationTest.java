@@ -141,7 +141,10 @@ class NotificationIntegrationTest {
         mvc.perform(get("/api/notifications/me").with(jwt().jwt(j -> j.subject(me.toString()))))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.totalElements").value(1))
-                .andExpect(jsonPath("$.content[0].orderId").value(o1.toString()));
+                .andExpect(jsonPath("$.content[0].orderId").value(o1.toString()))
+                // The mail went to a local sink, not to a real inbox - the response says so.
+                .andExpect(jsonPath("$.content[0].simulated").value(true))
+                .andExpect(jsonPath("$.content[0].recipient").value(me + "@customers.orders.local"));
         mvc.perform(get("/api/notifications/me")).andExpect(status().isUnauthorized());
     }
 

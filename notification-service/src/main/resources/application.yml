@@ -7,7 +7,7 @@ spring:
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${NOTIFICATION_DB_NAME:notification_db}
     username: ${NOTIFICATION_DB_USER:notification_user}
-    password: ${NOTIFICATION_DB_PASSWORD:notification_pass}
+    password: ${NOTIFICATION_DB_PASSWORD:notification_local_dev_only}
     hikari:
       maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
   jpa:

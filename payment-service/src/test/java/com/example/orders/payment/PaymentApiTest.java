@@ -30,7 +30,10 @@ class PaymentApiTest extends PaymentIntegrationTest {
                 .andExpect(jsonPath("$.status").value("AUTHORIZED"))
                 .andExpect(jsonPath("$.amount").value(99.90))
                 .andExpect(jsonPath("$.currency").value("EUR"))
-                .andExpect(jsonPath("$.providerRef").isNotEmpty());
+                .andExpect(jsonPath("$.providerRef").isNotEmpty())
+                // Every payment this service reports is simulated - the response has to say so,
+                // so nobody can read a captured response as a real charge.
+                .andExpect(jsonPath("$.simulated").value(true));
     }
 
     @Test

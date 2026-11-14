@@ -7,7 +7,7 @@ spring:
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${INVENTORY_DB_NAME:inventory_db}
     username: ${INVENTORY_DB_USER:inventory_user}
-    password: ${INVENTORY_DB_PASSWORD:inventory_pass}
+    password: ${INVENTORY_DB_PASSWORD:inventory_local_dev_only}
     hikari:
       maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
   jpa:

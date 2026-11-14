@@ -8,6 +8,12 @@
 #
 # Host ports are deliberately off the usual defaults (5433/6379/5000/7000 are taken on
 # this machine): Postgres 5435, Kafka 9094, Redis 6380, MailHog 1025/8025.
+#
+# Every published port is bound to 127.0.0.1 by default (BIND_ADDRESS), so a development stack
+# is not reachable from the network. The containers talk to each other over the compose network
+# by service name, so nothing inside the stack needs the host interface. Set BIND_ADDRESS to
+# 0.0.0.0 only deliberately, and only together with the credential changes listed in README
+# "Before deploying on a network".
 
 name: order-processing
 
@@ -31,6 +37,9 @@ x-app-env: &app-env
   OTLP_TRACING_EXPORT_ENABLED: ${OTLP_TRACING_EXPORT_ENABLED:-false}
   OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
   JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=65"
+  # Shared by all six services (each has its own database).
+  DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-5}
+  KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
 
 services:
   postgres:
@@ -42,10 +51,33 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres_local_dev_only}
       POSTGRES_DB: postgres
+      # initdb otherwise leaves the container's TCP loopback entries as "trust", even when
+      # POSTGRES_HOST_AUTH_METHOD requires passwords for other hosts. Both settings take effect
+      # only on a fresh data volume; local Unix sockets remain accessible inside the container.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      # Per-service database owners. The bootstrap script reads these (see
+      # infra/postgres/init/01-create-databases.sh), so the values here are the values the
+      # services connect with. The defaults are local-development passwords and say so.
+      AUTH_DB_NAME: ${AUTH_DB_NAME:-auth_db}
+      AUTH_DB_USER: ${AUTH_DB_USER:-auth_user}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-auth_local_dev_only}
+      ORDER_DB_NAME: ${ORDER_DB_NAME:-order_db}
+      ORDER_DB_USER: ${ORDER_DB_USER:-order_user}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local_dev_only}
+      INVENTORY_DB_NAME: ${INVENTORY_DB_NAME:-inventory_db}
+      INVENTORY_DB_USER: ${INVENTORY_DB_USER:-inventory_user}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local_dev_only}
+      PAYMENT_DB_NAME: ${PAYMENT_DB_NAME:-payment_db}
+      PAYMENT_DB_USER: ${PAYMENT_DB_USER:-payment_user}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_local_dev_only}
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notification_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_user}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_local_dev_only}
     ports:
-      - "${POSTGRES_PORT:-5435}:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5435}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -61,15 +93,17 @@ services:
     restart: unless-stopped
     ports:
       # External listener for host processes (the services running via mvn spring-boot:run).
-      - "${KAFKA_EXTERNAL_PORT:-9094}:9094"
+      - "${BIND_ADDRESS:-127.0.0.1}:${KAFKA_EXTERNAL_PORT:-9094}:9094"
     environment:
       # Single-node KRaft: this container is both broker and controller.
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
-      # INTERNAL is for future containerised services, EXTERNAL for host clients.
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      # INTERNAL is for future containerised services, EXTERNAL for host clients. The EXTERNAL
+      # advertised address must be the one clients actually dial, so it follows the published
+      # host port (and KAFKA_EXTERNAL_HOST when the broker is not on the same machine).
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_EXTERNAL_PORT:-9094}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -96,13 +130,30 @@ services:
     image: redis:7
     container_name: op-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    # Redis has no authentication by default here, which is fine for a development cache that is
+    # bound to 127.0.0.1 only. Set REDIS_PASSWORD before putting this on a network: the flag is
+    # then passed to the server and the gateway authenticates with it.
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass "$$REDIS_PASSWORD"
+        else
+          exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+        fi
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
-      - "${REDIS_PORT:-6380}:6379"
+      - "${BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-6380}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # With --requirepass set, `redis-cli ping` answers "NOAUTH Authentication required." and
+      # still exits 0, so a plain check would report healthy without ever proving that the
+      # configured password works. This one authenticates when a password is configured and stays
+      # plain when there is none.
+      test: ['CMD-SHELL', 'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi']
       interval: 5s
       timeout: 5s
       retries: 20
@@ -113,8 +164,8 @@ services:
     container_name: op-mailhog
     restart: unless-stopped
     ports:
-      - "${MAILHOG_SMTP_PORT:-1025}:1025"
-      - "${MAILHOG_UI_PORT:-8025}:8025"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MAILHOG_SMTP_PORT:-1025}:1025"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MAILHOG_UI_PORT:-8025}:8025"
     healthcheck:
       # The image has no curl/wget; MailHog's own binary can probe the UI port.
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8025 || exit 1"]
@@ -134,10 +185,19 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8081
+      AUTH_DB_NAME: ${AUTH_DB_NAME:-auth_db}
+      AUTH_DB_USER: ${AUTH_DB_USER:-auth_user}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-auth_local_dev_only}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-order-processing-auth}
+      AUTH_JWT_EXPIRATION: ${AUTH_JWT_EXPIRATION:-PT1H}
       AUTH_JWT_KEY_ID: ${AUTH_JWT_KEY_ID:-}
       AUTH_JWT_PRIVATE_KEY: ${AUTH_JWT_PRIVATE_KEY:-}
       AUTH_JWT_PUBLIC_KEY: ${AUTH_JWT_PUBLIC_KEY:-}
-    ports: ["8081:8081"]
+      # The seeded administrator. Change it before the first start of a shared environment.
+      AUTH_ADMIN_EMAIL: ${AUTH_ADMIN_EMAIL:-admin@orders.local}
+      AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD:-Admin@LocalDevOnly}
+      AUTH_ADMIN_NAME: ${AUTH_ADMIN_NAME:-Platform Admin}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8081:8081"]
     depends_on: { postgres: { condition: service_healthy } }
 
   inventory-service:
@@ -148,11 +208,15 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8083
+      INVENTORY_DB_NAME: ${INVENTORY_DB_NAME:-inventory_db}
+      INVENTORY_DB_USER: ${INVENTORY_DB_USER:-inventory_user}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local_dev_only}
       INVENTORY_SEED_DEMO: ${INVENTORY_SEED_DEMO:-true}
+      INVENTORY_RESERVATION_MAX_ATTEMPTS: ${INVENTORY_RESERVATION_MAX_ATTEMPTS:-3}
       # Operator reconciliation verifies an order's state with order-service (GET /api/orders/{id},
       # forwarding the administrator's own token) before it releases anything.
       ORDER_BASE_URL: http://order-service:8082
-    ports: ["8083:8083"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8083:8083"]
     depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 
   order-service:
@@ -163,8 +227,13 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8082
+      ORDER_DB_NAME: ${ORDER_DB_NAME:-order_db}
+      ORDER_DB_USER: ${ORDER_DB_USER:-order_user}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local_dev_only}
       INVENTORY_BASE_URL: http://inventory-service:8083
-    ports: ["8082:8082"]
+      ORDER_SAGA_TIMEOUT: ${ORDER_SAGA_TIMEOUT:-PT2M}
+      ORDER_SAGA_REFUND_RETRY_INTERVAL: ${ORDER_SAGA_REFUND_RETRY_INTERVAL:-PT30S}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8082:8082"]
     depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 
   payment-service:
@@ -175,7 +244,14 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8084
-    ports: ["8084:8084"]
+      PAYMENT_DB_NAME: ${PAYMENT_DB_NAME:-payment_db}
+      PAYMENT_DB_USER: ${PAYMENT_DB_USER:-payment_user}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_local_dev_only}
+      # The simulated provider - no acquirer is contacted, no money moves.
+      PAYMENT_DECLINE_ABOVE: ${PAYMENT_DECLINE_ABOVE:-1000.00}
+      PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0}
+      PAYMENT_MAX_ATTEMPTS: ${PAYMENT_MAX_ATTEMPTS:-3}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8084:8084"]
     depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 
   notification-service:
@@ -186,9 +262,15 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8085
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notification_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_user}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_local_dev_only}
+      NOTIFICATION_FROM: ${NOTIFICATION_FROM:-orders@orders.local}
+      NOTIFICATION_RECIPIENT_DOMAIN: ${NOTIFICATION_RECIPIENT_DOMAIN:-customers.orders.local}
+      NOTIFICATION_EMAIL_ENABLED: ${NOTIFICATION_EMAIL_ENABLED:-true}
       MAIL_HOST: mailhog
       MAIL_PORT: 1025
-    ports: ["8085:8085"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8085:8085"]
     depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, mailhog: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 
   api-gateway:
@@ -199,12 +281,22 @@ services:
     environment:
       <<: *app-env
       SERVER_PORT: 8080
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_TIMEOUT: ${REDIS_TIMEOUT:-500ms}
+      REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT:-500ms}
+      GATEWAY_CORS_ORIGINS: ${GATEWAY_CORS_ORIGINS:-http://localhost:5173}
+      RATE_LIMIT_REPLENISH_RATE: ${RATE_LIMIT_REPLENISH_RATE:-10}
+      RATE_LIMIT_BURST_CAPACITY: ${RATE_LIMIT_BURST_CAPACITY:-20}
+      RATE_LIMIT_REQUESTED_TOKENS: ${RATE_LIMIT_REQUESTED_TOKENS:-1}
+      MANAGEMENT_GATEWAY_ENDPOINT_ACCESS: ${MANAGEMENT_GATEWAY_ENDPOINT_ACCESS:-unrestricted}
+      # Must be the same issuer auth-service signs with.
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-order-processing-auth}
       AUTH_SERVICE_URI: http://auth-service:8081
       ORDER_SERVICE_URI: http://order-service:8082
       INVENTORY_SERVICE_URI: http://inventory-service:8083
       PAYMENT_SERVICE_URI: http://payment-service:8084
       NOTIFICATION_SERVICE_URI: http://notification-service:8085
-    ports: ["8080:8080"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8080:8080"]
     depends_on: { redis: { condition: service_healthy }, auth-service: { condition: service_healthy } }
 
   # ------------------------------------------------------------------ observability
@@ -219,8 +311,8 @@ services:
       COLLECTOR_OTLP_ENABLED: "true"
       MEMORY_MAX_TRACES: "5000"
     ports:
-      - "16686:16686"   # UI
-      - "4318:4318"     # OTLP over HTTP (services export traces here)
+      - "${BIND_ADDRESS:-127.0.0.1}:16686:16686"   # UI
+      - "${BIND_ADDRESS:-127.0.0.1}:4318:4318"     # OTLP over HTTP (services export traces here)
     mem_limit: 256m
 
   prometheus:
@@ -230,7 +322,7 @@ services:
     profiles: ["observability"]
     restart: unless-stopped
     extra_hosts: ["host.docker.internal:host-gateway"]
-    ports: ["9090:9090"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:9090:9090"]
     mem_limit: 256m
 
   grafana:
@@ -242,9 +334,9 @@ services:
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-grafana_local_dev_only}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/order-processing.json
-    ports: ["3000:3000"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:3000:3000"]
     depends_on: [prometheus, jaeger]
     mem_limit: 256m
 
